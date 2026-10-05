@@ -33,6 +33,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
+from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
 from nemo_gym.sandbox import AsyncSandbox
 from nemo_gym.sandbox.providers.base import SandboxExecResult, SandboxHandle
 from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
@@ -45,6 +46,7 @@ from resources_servers.gdpval.app import (
     _iter_ref_repeat_dirs,
     _strict_comparison_trial_failure,
 )
+from resources_servers.gdpval.comparison import task_attempted
 from resources_servers.gdpval.task_data import GDPFileTask, prepare_row
 
 
@@ -2713,3 +2715,84 @@ def test_sandbox_config_requires_complete_runtime_settings(sandbox_server, missi
     instance, _, _ = sandbox_server
     with pytest.raises(ValidationError, match="Sandbox sessions require"):
         GDPValResourcesServerConfig.model_validate(instance.config.model_dump() | {missing: None})
+
+
+async def test_export_writes_completion_marker_and_skips_run_state_files(sandbox_server):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.files["/workspace/output/finish_params.json"] = b"not a marker"
+    box.files["/workspace/output/history.json"] = b"{}"
+    target = await instance.export_deliverables("resources-1")
+    assert sorted(p.name for p in target.iterdir()) == ["finish_params.json", "report.csv"]
+    assert json.loads((target / "finish_params.json").read_text()) == {"paths": ["report.csv"]}
+    assert task_attempted(str(target))
+    assert not list(instance.config.deliverables_root.glob("*.tmp"))
+
+
+def _reference_models(root):
+    references = {}
+    for ref_id, elo in (("ref_a", 1100.0), ("ref_b", 1300.0)):
+        repeat = root / ref_id / "task_task-1" / "repeat_0"
+        repeat.mkdir(parents=True)
+        (repeat / "finish_params.json").write_text("{}")
+        (repeat / "answer.csv").write_text("x,1\n")
+        references[ref_id] = {"deliverables_dir": str(root / ref_id), "elo": elo}
+    return references
+
+
+@pytest.fixture
+def comparison_sandbox_server(tmp_path, monkeypatch):
+    box = Sandbox()
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", lambda provider: box)
+    monkeypatch.setattr(gdp_app, "get_global_config_dict", lambda: {})
+    monkeypatch.setattr(gdp_app, "resolve_provider_config", lambda *args: {"docker": {}})
+    config = GDPValResourcesServerConfig(
+        host="127.0.0.1",
+        port=8000,
+        name="resources",
+        entrypoint="app.py",
+        sandbox_provider="sandbox",
+        num_workers=1,
+        image="test-only",
+        deliverables_root=tmp_path / "exports",
+        preconvert_office_to_pdf=False,
+        reward_mode="comparison",
+        reference_models=_reference_models(tmp_path / "refs"),
+        num_comparison_trials=4,
+        judge_model_server={"type": "responses_api_models", "name": "judge"},
+    )
+    instance = GDPValResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    return instance, SimpleNamespace(session={})
+
+
+async def test_sandbox_comparison_judges_exported_files_against_assigned_reference(comparison_sandbox_server):
+    # Multistage ELO stamps reference_ids and stage_index on each row; single_agent_turn_legacy forwards them as task_data.
+    instance, request = comparison_sandbox_server
+    body = ResourcesSeedSessionRequest(
+        resources_session_id="resources-1",
+        episode_id=EpisodeId(rollout_id="rollout-1"),
+        task_id=TaskId(taskset="gdp", task_id="task-1"),
+        task_data=row(reference_ids=["ref_b"], stage_index=0),
+    )
+    await instance.seed_session(request, body)
+    judged = {
+        "winner": "[[B]]",
+        "win_count_a": 0,
+        "win_count_b": 4,
+        "tie_count": 0,
+        "task_count": 4,
+        "invalid_count": 0,
+    }
+    run_trials = MagicMock(return_value=judged)
+    with (
+        patch("resources_servers.gdpval.comparison.run_trials", new=run_trials),
+        patch("resources_servers.gdpval.app.get_server_url", return_value="http://localhost:9999"),
+        patch("resources_servers.gdpval.comparison.build_file_section", return_value=[]),
+        patch("openai.OpenAI", return_value=MagicMock()),
+    ):
+        result = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    # Without the export marker every row came back as eval_missing and no judge call was made.
+    assert result.model_dump().get(NG_FAILURE_CLASS_KEY) is None
+    assert set(result.per_reference) == {"ref_b"}
+    assert result.total_wins == 4
+    run_trials.assert_called_once()

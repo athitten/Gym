@@ -101,6 +101,11 @@ def relative_file(value: str) -> str:
     return value
 
 
+def json_list(value: object) -> object:
+    """Decode a list column that a row stores as a JSON string."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
 class GDPFileTask(BaseModel):
     """Validate task inputs without exposing verifier metadata to the harness."""
 
@@ -113,7 +118,7 @@ class GDPFileTask(BaseModel):
     @field_validator("reference_files", "reference_file_urls", mode="before")
     @classmethod
     def parse_lists(cls, value: object) -> object:
-        return json.loads(value) if isinstance(value, str) else value
+        return json_list(value)
 
     @model_validator(mode="after")
     def validate_references(self) -> Self:
@@ -142,7 +147,8 @@ def prepare_row(row: dict[str, JsonValue]) -> dict[str, JsonValue]:
         "When finished, reply with a brief summary and the names of your deliverables.\n\n"
         f"Task:\n{task.prompt}"
     )
-    result = dict(row)
+    # Write the decoded lists back so prepared rows match TaskData and GDPValVerifyRequest.
+    result = dict(row) | task.model_dump(include={"reference_files", "reference_file_urls"})
     params = dict(row.get("responses_create_params") or {})
     params["input"] = [{"role": "user", "content": prompt}]
     result["responses_create_params"] = params

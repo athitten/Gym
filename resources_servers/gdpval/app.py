@@ -65,6 +65,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef
+from nemo_gym.deliverables import IGNORE_FILES
 from nemo_gym.episode_types import EpisodeId
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_TERMINAL_KEY
@@ -697,16 +698,27 @@ class GDPValResourcesServer(SimpleResourcesServer):
         # An attempt gets a fresh directory. Never delete or overwrite another attempt's files.
         target = Path(tempfile.mkdtemp(prefix="gdp-", dir=self.config.deliverables_root))
         total = 0
+        exported = []
         for item in files:
             name = relative_file(item["name"])
             if "/" in name or not isinstance(item["size"], int) or item["size"] < 0:
                 raise HTTPException(503, "Invalid GDP artifact entry")
+            if name in IGNORE_FILES:
+                # Run-state names are never graded, and the completion marker below must come from this server.
+                continue
             total += item["size"]
             if total > _MAX_BYTES:
                 raise HTTPException(503, "GDP artifact size limit exceeded")
             await session.sandbox.download(f"{OUTPUT_DIR}/{name}", target / name)
             if (target / name).stat().st_size != item["size"]:
                 raise HTTPException(503, "GDP artifact changed during export")
+            exported.append(name)
+        # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self.config.deliverables_root, suffix=".tmp", delete=False
+        ) as marker:
+            json.dump({"paths": sorted(exported)}, marker)
+        Path(marker.name).replace(target / "finish_params.json")
         session.deliverables = target
         return target
 

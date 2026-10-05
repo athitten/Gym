@@ -32,14 +32,18 @@ from environment_servers.single_agent_turn.app import (
 from nemo_gym.sandbox import AsyncSandbox
 from nemo_gym.server_utils import SESSION_ID_KEY, BaseServerConfig, ServerClient
 from nemo_gym.server_utils import request as http_request
-from resources_servers.gdpval.app import GDPValVerifyRequest, GDPValVerifyResponse
-from resources_servers.gdpval.sandbox_app import GDPSandboxConfig, GDPSandboxResourcesServer
-from resources_servers.gdpval.sandbox_tasks import GDPFileTask, prepare_row
+from resources_servers.gdpval.app import (
+    GDPValResourcesServer,
+    GDPValResourcesServerConfig,
+    GDPValVerifyRequest,
+    GDPValVerifyResponse,
+)
+from resources_servers.gdpval.task_data import GDPFileTask, prepare_row
 from responses_api_agents.pi_agent.app import PiAgent, PiAgentConfig
 from responses_api_models.openai_model.app import SimpleModelServer, SimpleModelServerConfig
 
 
-class ExportOnlyResources(GDPSandboxResourcesServer):
+class ExportOnlyResources(GDPValResourcesServer):
     """Test-only local reference and no-judge boundary; production scorer is unchanged."""
 
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
@@ -81,8 +85,10 @@ async def run(args: argparse.Namespace) -> None:
     global_config._GLOBAL_CONFIG_DICT = cfg
     client = ServerClient(head_server_config=BaseServerConfig(host="127.0.0.1", port=1), global_config_dict=cfg)
     resources = ExportOnlyResources(
-        config=GDPSandboxConfig(
+        config=GDPValResourcesServerConfig(
             **common["resources"],
+            sandbox_provider="sandbox",
+            num_workers=1,
             image=args.image,
             deliverables_root=args.output,
             preconvert_office_to_pdf=False,

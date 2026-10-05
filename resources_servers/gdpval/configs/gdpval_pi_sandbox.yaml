@@ -8,7 +8,9 @@ config_paths:
 gdpval_resources_server:
   resources_servers:
     gdpval:
-      entrypoint: sandbox_app.py
+      entrypoint: app.py
+      sandbox_provider: sandbox
+      num_workers: 1
       allowed_agents:
       - pi_agent
       image: ???

@@ -20,6 +20,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
+from typing import Sequence
 
 
 LOGGER = logging.getLogger(__name__)
@@ -48,6 +51,8 @@ _APT_PACKAGES = (
 # same mirror, which can take well over 10 minutes. Leave generous headroom:
 # in comparison mode a failed install aborts resources-server startup.
 _APT_INSTALL_TIMEOUT_S = 1800
+# A cold container start (e.g. an image on a shared filesystem) is slower than a host binary.
+_COMMAND_CHECK_TIMEOUT_S = 120
 
 
 def _run(cmd: list[str], *, timeout: int) -> tuple[int, str, str]:
@@ -105,8 +110,70 @@ def _javaldx_works() -> bool:
     return rc == 0 and bool(out.strip())
 
 
-def ensure_libreoffice() -> bool:
+def _write_probe_workbook(path: Path) -> None:
+    """One sheet with a formula and a chart: the content the javaldx check protects."""
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in (("Quarter", "Revenue"), ("Q1", 10), ("Q2", 30)):
+        sheet.append(row)
+    sheet["C2"] = "=SUM(B2:B3)"
+    chart = BarChart()
+    chart.add_data(Reference(sheet, min_col=2, min_row=1, max_row=3), titles_from_data=True)
+    sheet.add_chart(chart, "E2")
+    workbook.save(path)
+
+
+def _command_works(libreoffice_command: Sequence[str]) -> bool:
+    """Return True iff *libreoffice_command* runs and converts a probe workbook to PDF.
+
+    The probe goes through ``convert_to_pdf`` in the temp directory that real
+    conversions use, so a container command that cannot see that directory
+    fails here instead of on every task.
+    """
+    from resources_servers.gdpval.preconvert import convert_to_pdf
+
+    try:
+        rc, out, err = _run([*libreoffice_command, "--version"], timeout=_COMMAND_CHECK_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning("libreoffice_command %s could not run: %r", libreoffice_command, exc)
+        return False
+    if rc != 0:
+        LOGGER.warning(
+            "libreoffice_command %s --version failed (rc=%d): %s",
+            libreoffice_command,
+            rc,
+            (err or "").strip()[:300],
+        )
+        return False
+
+    probe_dir = Path(tempfile.mkdtemp(prefix="gdpval-lo-probe-"))
+    try:
+        probe = probe_dir / "probe.xlsx"
+        _write_probe_workbook(probe)
+        _, ok, message = convert_to_pdf(probe, libreoffice_command=libreoffice_command)
+        if not ok or not probe.with_suffix(".pdf").read_bytes().startswith(b"%PDF"):
+            LOGGER.warning(
+                "libreoffice_command %s did not convert a probe workbook in %s: %s",
+                libreoffice_command,
+                probe_dir,
+                message,
+            )
+            return False
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    LOGGER.info("libreoffice_command ready: %s", out.strip())
+    return True
+
+
+def ensure_libreoffice(libreoffice_command: Sequence[str] | None = None) -> bool:
     """Make sure libreoffice + a *functional* JRE are present on Linux.
+
+    With *libreoffice_command* (e.g. a container prefix), only that command is
+    checked, by ``--version`` and a real conversion; the host packages, javaldx
+    and apt below are not used.
 
     Returns True if libreoffice + a usable JRE are available after the call.
 
@@ -125,6 +192,9 @@ def ensure_libreoffice() -> bool:
     tasks keep working; comparison-mode preconvert will surface its own
     per-file errors via ``preconvert.py``.
     """
+    if libreoffice_command is not None:
+        return _command_works(libreoffice_command)
+
     if not sys.platform.startswith("linux"):
         LOGGER.warning(
             "auto-install only supports Linux (sys.platform=%s); GDPVal preconvert will be a no-op.",
@@ -186,5 +256,6 @@ def ensure_libreoffice() -> bool:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    ok = ensure_libreoffice()
+    # Optional argv: check a configured command, e.g. `apptainer exec ... libreoffice`.
+    ok = ensure_libreoffice(sys.argv[1:] or None)
     sys.exit(0 if ok else 1)

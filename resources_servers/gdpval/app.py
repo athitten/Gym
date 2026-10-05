@@ -79,7 +79,7 @@ from resources_servers.gdpval.judge_panel import (
     panel_summary,
 )
 from resources_servers.gdpval.scoring import SCORING_ERROR_KEY
-from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, relative_file
+from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, json_list, relative_file
 
 
 LOGGER = logging.getLogger(__name__)
@@ -466,6 +466,12 @@ class GDPValVerifyRequest(BaseVerifyRequest):
     ng_rollout_index: Optional[int] = Field(default=None, alias="_ng_rollout_index")
     ng_attempt_index: Optional[int] = Field(default=None, alias="_ng_attempt_index")
 
+    @field_validator("reference_file_urls", mode="before")
+    @classmethod
+    def parse_reference_file_urls(cls, value: object) -> object:
+        # Accept the JSON-encoded list that GDPFileTask accepts at seed time.
+        return json_list(value)
+
 
 # The reference model has no deliverable for this task, so no battle can be
 # scored. An infrastructure gap, not a model outcome. Kept here rather than in
@@ -514,6 +520,8 @@ class _Session:
     seed: ResourcesSeedSessionRequest
     sandbox: AsyncSandbox
     ready: bool = False
+    # A failed seed stopped (or failed to stop) this sandbox; AsyncSandbox cannot start again after stop().
+    failed: bool = False
     deliverables: Path | None = None
     verdict: GDPValVerifyResponse | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -595,8 +603,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
             raise HTTPException(409, "Resources session is already closed")
         session = self._sessions.get(session_id)
         if session is None:
-            provider = resolve_provider_config(self.config.sandbox_provider, get_global_config_dict())
-            session = _Session(body.model_copy(deep=True), AsyncSandbox(provider))
+            session = _Session(body.model_copy(deep=True), self._new_sandbox())
             self._sessions[session_id] = session
         if session.seed != body:
             raise HTTPException(409, "Session is already bound to another request")
@@ -605,6 +612,10 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise HTTPException(409, "Resources session is already closed")
             if not session.ready:
                 try:
+                    if session.failed:
+                        # Same-session retry: finish the failed attempt's cleanup, then use a fresh handle.
+                        await session.sandbox.stop()
+                        session.sandbox = self._new_sandbox()
                     await session.sandbox.start(SandboxSpec(image=self.config.image, workdir=WORKDIR))
                     result = await session.sandbox.exec(f"mkdir -p {INPUT_DIR} {OUTPUT_DIR}", timeout_s=30)
                     if result.return_code != 0:
@@ -612,7 +623,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     await self._stage_references(session.sandbox, task)
                     session.ready = True
                 except BaseException:
-                    # Leave the handle reachable if stop fails; close_session can retry.
+                    session.failed = True
+                    # Leave the handle reachable if stop fails; close_session or a seed retry can stop it.
                     try:
                         await session.sandbox.stop()
                     except BaseException:
@@ -629,6 +641,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     workdir=WORKDIR,
                 ),
             )
+
+    def _new_sandbox(self) -> AsyncSandbox:
+        return AsyncSandbox(resolve_provider_config(self.config.sandbox_provider, get_global_config_dict()))
 
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
         with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:

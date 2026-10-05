@@ -33,6 +33,8 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
+from nemo_gym.sandbox import AsyncSandbox
+from nemo_gym.sandbox.providers.base import SandboxExecResult, SandboxHandle
 from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
 from resources_servers.gdpval import app as gdp_app
 from resources_servers.gdpval.app import (
@@ -2230,6 +2232,8 @@ def test_prepare_only_exposes_prompt_and_reference_paths():
     assert "/workspace/output" in text
     assert "finish tool" not in text
     assert prepared["rubric_pretty"] == "PRIVATE RUBRIC"
+    assert prepared["reference_files"] == ["a.xlsx"]
+    assert prepared["reference_file_urls"] == ["https://example.com/a.xlsx"]
     assert source["responses_create_params"]["input"] == []
 
 
@@ -2398,6 +2402,129 @@ async def test_other_session_cannot_verify_or_close(sandbox_server):
                 episode_id=EpisodeId(rollout_id="other"),
             ),
         )
+
+
+class LifecycleProvider:
+    """Provider fake; the real AsyncSandbox enforces start/stop state."""
+
+    name = "lifecycle"
+
+    def __init__(self, boxes, close_errors):
+        self.boxes, self.close_errors = boxes, close_errors
+
+    async def create(self, spec):
+        handle = SandboxHandle(sandbox_id=f"box-{len(self.boxes)}", provider_name=self.name, raw=None)
+        self.boxes[handle.sandbox_id] = "live"
+        return handle
+
+    async def exec(self, handle, command, **kwargs):
+        return SandboxExecResult(stdout="[]", stderr="", return_code=0)
+
+    async def close(self, handle):
+        if self.close_errors:
+            raise self.close_errors.pop(0)
+        self.boxes[handle.sandbox_id] = "closed"
+
+    async def aclose(self):
+        pass
+
+    async def serialize_handle(self, handle, *, scope=None):
+        return {"sandbox_id": handle.sandbox_id}
+
+    async def connect(self, descriptor):
+        raise NotImplementedError
+
+
+@pytest.fixture
+def lifecycle_server(sandbox_server, monkeypatch):
+    instance, _, request = sandbox_server
+    boxes, close_errors = {}, []
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", lambda provider: AsyncSandbox(LifecycleProvider(boxes, close_errors)))
+    staging = AsyncMock(side_effect=[RuntimeError("download failed"), None])
+    monkeypatch.setattr(instance, "_stage_references", staging)
+    return instance, boxes, close_errors, request
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_same_session_seed_retry_replaces_failed_sandbox(lifecycle_server, cleanup_fails):
+    instance, boxes, close_errors, request = lifecycle_server
+    if cleanup_fails:
+        close_errors.append(RuntimeError("provider unavailable"))
+    with pytest.raises(RuntimeError, match="download failed"):
+        await instance.seed_session(request, seed())
+    seeded = await instance.seed_session(request, seed())
+    assert seeded.sandbox_access.connection.descriptor["sandbox_id"] == "box-1"
+    assert boxes == {"box-0": "closed", "box-1": "live"}
+
+
+async def test_seed_retry_waiting_on_failed_attempt_gets_fresh_sandbox(lifecycle_server, monkeypatch):
+    instance, boxes, _, request = lifecycle_server
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stage(sandbox, task):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+            raise RuntimeError("download failed")
+
+    monkeypatch.setattr(instance, "_stage_references", stage)
+    first = asyncio.create_task(instance.seed_session(request, seed()))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    second = asyncio.create_task(instance.seed_session(request, seed()))
+    await asyncio.sleep(0)  # The resent request now waits on the session lock.
+    release.set()
+    with pytest.raises(RuntimeError, match="download failed"):
+        await asyncio.wait_for(first, timeout=5)
+    seeded = await asyncio.wait_for(second, timeout=5)
+    assert seeded.sandbox_access.connection.descriptor["sandbox_id"] == "box-1"
+    assert boxes == {"box-0": "closed", "box-1": "live"}
+
+
+async def test_seed_retry_never_replaces_unstopped_sandbox(lifecycle_server):
+    instance, boxes, close_errors, request = lifecycle_server
+    close_errors.extend([RuntimeError("provider unavailable")] * 10)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            await instance.seed_session(request, seed())
+    assert boxes == {"box-0": "live"}
+    close_errors.clear()
+    close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+    await instance.close_resources_session(request, close)
+    assert boxes == {"box-0": "closed"}
+
+
+def test_app_http_json_string_reference_lists_verify(sandbox_server, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    instance, box, _ = sandbox_server
+
+    async def chunks(*args):
+        yield b"reference"
+
+    download = SimpleNamespace(
+        raise_for_status=MagicMock(), release=MagicMock(), content=SimpleNamespace(iter_chunked=chunks)
+    )
+    monkeypatch.setattr(gdp_app, "http_request", AsyncMock(return_value=download))
+    graded = []
+
+    async def grade(self, body):
+        graded.append(body)
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.75)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    body = seed()
+    body.task_data.update(reference_files='["a.xlsx"]', reference_file_urls='["https://example.com/a.xlsx"]')
+    with TestClient(instance.setup_webserver()) as client:
+        assert client.post("/seed_session", json=body.model_dump(mode="json")).status_code == 200
+        # single_agent_turn sends task_data | {responses_create_params, response} to /verify.
+        verify = body.task_data | {
+            "responses_create_params": {"input": []},
+            "response": response().model_dump(mode="json"),
+        }
+        result = client.post("/verify", json=verify)
+        assert result.status_code == 200, result.text
+    assert box.files["/workspace/input/a.xlsx"] == b"reference"
+    assert graded[0].reference_file_urls == ["https://example.com/a.xlsx"]
 
 
 def test_config_rejects_relative_output_and_multiple_workers(sandbox_server):

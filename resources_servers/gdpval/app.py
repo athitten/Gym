@@ -743,8 +743,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
             except (ClientResponseError, ClientConnectionError, ClientPayloadError, TimeoutError) as error:
                 # Report failures as HTTP errors: a bare aiohttp error would reach the caller as a generic 500.
                 status = getattr(error, "status", None)
-                if status is not None and status not in (408, 429) and status < 500:
-                    # A missing or forbidden file fails the same way on every retry, so the status is terminal.
+                # A missing or forbidden file fails the same way on every retry, so a 4xx is terminal, except timeout
+                # and throttling statuses. aiohttp reports some malformed responses as status 0, which is retried.
+                if status is not None and 400 <= status < 500 and status not in (408, 425, 429):
                     raise HTTPException(424, f"Reference download failed with HTTP {status}: {url}") from error
                 if attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
                     raise HTTPException(

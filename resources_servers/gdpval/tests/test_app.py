@@ -2466,7 +2466,8 @@ async def test_reference_over_size_limit_fails_terminally(sandbox_server, monkey
     box.serialize.assert_not_awaited()
 
 
-@pytest.mark.parametrize("status", [429, 503])
+# 0 is aiohttp's status for some malformed responses; the Environment Server also retries 425.
+@pytest.mark.parametrize("status", [0, 425, 429, 503])
 async def test_reference_download_retries_transient_errors(sandbox_server, monkeypatch, status):
     instance, box, request = sandbox_server
     download = _reference_download(status, b"reference")

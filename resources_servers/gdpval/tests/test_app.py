@@ -2281,6 +2281,8 @@ def response():
 class Sandbox:
     def __init__(self):
         self.files = {"/workspace/output/report.csv": b"name,value\na,3\n"}
+        # False models a missing or symlinked /workspace/output, which the listing reports without entries.
+        self.output_dir = True
         self.start = AsyncMock()
         self.stop = AsyncMock()
         self.serialize = AsyncMock(return_value={"sandbox_id": "task-box"})
@@ -2292,9 +2294,10 @@ class Sandbox:
         files = [
             {"name": key.removeprefix("/workspace/output/"), "size": len(value), "regular": True}
             for key, value in self.files.items()
-            if key.startswith("/workspace/output/")
+            if key.startswith("/workspace/output/") and self.output_dir
         ]
-        return SimpleNamespace(return_code=0, stdout=json.dumps(files), stderr="")
+        listing = {"output_dir": self.output_dir, "entries": files}
+        return SimpleNamespace(return_code=0, stdout=json.dumps(listing), stderr="")
 
     async def upload_file(self, local, remote):
         self.files[remote] = Path(local).read_bytes()
@@ -2682,7 +2685,7 @@ class LifecycleProvider:
         return handle
 
     async def exec(self, handle, command, **kwargs):
-        return SandboxExecResult(stdout="[]", stderr="", return_code=0)
+        return SandboxExecResult(stdout=json.dumps({"output_dir": True, "entries": []}), stderr="", return_code=0)
 
     async def close(self, handle):
         if self.close_errors:
@@ -2816,25 +2819,30 @@ def test_actual_export_listing_flags_nonregular_deliverables(tmp_path, kind):
     script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    [entry] = json.loads(result.stdout)
+    listing = json.loads(result.stdout)
+    assert listing["output_dir"] is True
+    [entry] = listing["entries"]
     assert entry["name"] == "report.csv"
     assert entry["regular"] is (kind == "file")
     if kind == "file":
         assert entry["size"] == 8
 
 
-@pytest.mark.parametrize("kind", ["missing", "symlink"])
-def test_actual_export_listing_ignores_unusable_output_directory(tmp_path, kind):
+@pytest.mark.parametrize(("kind", "usable"), [("missing", False), ("symlink", False), ("empty", True)])
+def test_actual_export_listing_reports_unusable_output_directory(tmp_path, kind, usable):
     output = tmp_path / "output"
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "private.csv").write_bytes(b"secret")
     if kind == "symlink":
         output.symlink_to(outside)
+    elif kind == "empty":
+        output.mkdir()
     script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == []
+    # A linked directory is never followed, and only an empty real one means the model saved nothing.
+    assert json.loads(result.stdout) == {"output_dir": usable, "entries": []}
 
 
 def test_app_http_sandbox_lifecycle_uses_seeded_metadata(sandbox_server, monkeypatch):
@@ -2911,10 +2919,24 @@ async def test_export_writes_completion_marker_and_skips_run_state_files(sandbox
     assert not list(instance.config.deliverables_root.glob("*.tmp"))
 
 
+async def test_unusable_output_directory_is_recorded_not_read_as_empty(sandbox_server):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.output_dir = False
+    target = await instance.export_deliverables("resources-1")
+    assert sorted(p.name for p in target.iterdir()) == ["finish_params.json"]
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": [],
+        "skipped": [{"name": "/workspace/output", "reason": "output directory missing or a symlink"}],
+    }
+    # Still a finished attempt, so the judge scores the empty submission instead of reporting it missing.
+    assert task_attempted(str(target))
+
+
 def _listing(*entries):
     """Sandbox exec result for the output listing: (name, size, regular) tuples."""
     rows = [{"name": name, "size": size, "regular": regular} for name, size, regular in entries]
-    return SimpleNamespace(return_code=0, stdout=json.dumps(rows), stderr="")
+    return SimpleNamespace(return_code=0, stdout=json.dumps({"output_dir": True, "entries": rows}), stderr="")
 
 
 async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, monkeypatch):
@@ -2969,17 +2991,29 @@ async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, mo
 
 
 @pytest.mark.parametrize(
-    "entry",
-    [{"name": "a.txt", "size": 1}, {"name": "a.txt", "size": -1, "regular": True}, {"name": 3, "regular": True}],
+    "listing",
+    [
+        {"output_dir": True, "entries": [{"name": "a.txt", "size": 1}]},
+        {"output_dir": True, "entries": [{"name": "a.txt", "size": -1, "regular": True}]},
+        {"output_dir": True, "entries": [{"name": 3, "regular": True}]},
+        {"output_dir": True, "entries": None},
+        {"output_dir": "yes", "entries": []},
+        {"entries": []},
+        [{"name": "a.txt", "size": 1, "regular": True}],
+        # Entries from a directory the listing reports as unusable.
+        {"output_dir": False, "entries": [{"name": "a.txt", "size": 1, "regular": True}]},
+    ],
 )
-async def test_malformed_output_listing_is_an_export_failure(sandbox_server, entry):
+async def test_malformed_output_listing_is_an_export_failure(sandbox_server, listing):
     instance, box, request = sandbox_server
     await instance.seed_session(request, seed())
+    box.files["/workspace/output/a.txt"] = b"x"
     box.exec.side_effect = None
-    box.exec.return_value = SimpleNamespace(return_code=0, stdout=json.dumps([entry]), stderr="")
+    box.exec.return_value = SimpleNamespace(return_code=0, stdout=json.dumps(listing), stderr="")
     with pytest.raises(HTTPException) as error:
         await instance.export_deliverables("resources-1")
     assert error.value.status_code == 503
+    assert not list(instance.config.deliverables_root.glob("gdp-*"))
 
 
 def _reference_models(root):

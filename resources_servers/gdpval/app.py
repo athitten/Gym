@@ -92,17 +92,19 @@ _MAX_EXPORT_FILES = 100
 _MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
 _REFERENCE_DOWNLOAD_ATTEMPTS = 4
 _REFERENCE_RETRY_BASE_DELAY_S = 2.0
-# Lists the top-level entries the export may copy; a missing or symlinked output directory lists nothing.
+# Lists the top-level entries the export may copy. It reports a missing or symlinked output directory instead of
+# listing it, so that case is not mistaken for a model that saved nothing.
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
+usable = root.is_dir() and not root.is_symlink()
 entries = []
-if root.is_dir() and not root.is_symlink():
+if usable:
     for path in sorted(root.iterdir()):
         info = path.lstat()
         regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
         entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
-print(json.dumps(entries))
+print(json.dumps({{'output_dir': usable, 'entries': entries}}))
 """
 
 
@@ -758,14 +760,22 @@ class GDPValResourcesServer(SimpleResourcesServer):
         result = await session.sandbox.exec(f"python3 -c {quote(_LIST_OUTPUTS)}", timeout_s=60)
         if result.return_code != 0:
             raise HTTPException(503, "GDP artifact export failed: " + (result.stderr or "listing failed")[-1000:])
-        entries = json.loads(result.stdout)
-        if not isinstance(entries, list) or not all(
-            isinstance(item, dict)
-            and isinstance(item.get("name"), str)
-            and isinstance(item.get("size"), int)
-            and item["size"] >= 0
-            and isinstance(item.get("regular"), bool)
-            for item in entries
+        listing = json.loads(result.stdout)
+        output_dir = listing.get("output_dir") if isinstance(listing, dict) else None
+        entries = listing.get("entries") if isinstance(listing, dict) else None
+        # Nothing may be exported from a directory the listing itself reports as unusable.
+        if (
+            not isinstance(output_dir, bool)
+            or not isinstance(entries, list)
+            or (entries and not output_dir)
+            or not all(
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("size"), int)
+                and item["size"] >= 0
+                and isinstance(item.get("regular"), bool)
+                for item in entries
+            )
         ):
             raise HTTPException(503, "Invalid GDP artifact listing")
         self.config.deliverables_root.mkdir(parents=True, exist_ok=True)
@@ -773,7 +783,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
         target = Path(tempfile.mkdtemp(prefix="gdp-", dir=self.config.deliverables_root))
         total = 0
         exported = []
-        skipped = []
+        skipped = [] if output_dir else [{"name": OUTPUT_DIR, "reason": "output directory missing or a symlink"}]
         for item in entries:
             reason = _export_skip_reason(item, len(exported), total)
             if reason is not None:

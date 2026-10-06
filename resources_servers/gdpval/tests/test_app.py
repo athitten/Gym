@@ -2541,8 +2541,20 @@ async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server
         await instance.seed_session(request, seed())
 
 
-async def test_invalid_judge_verdict_keeps_export_for_rejudging(sandbox_server, monkeypatch):
+@pytest.mark.parametrize(
+    ("judge_response", "failure_kind"),
+    [
+        ({"scoring_error": "no_valid_scores"}, "judge_unparseable"),
+        (None, "judge_failed"),
+        ({"scoring_error": "missing_rubric"}, "verifier_error"),
+    ],
+)
+async def test_invalid_judge_verdict_keeps_export_for_rejudging(
+    sandbox_server, monkeypatch, judge_response, failure_kind
+):
     from nemo_gym.config_types import AggregateMetricsRequest
+    from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+    from nemo_gym.reward_profile import select_measured
 
     instance, _, request = sandbox_server
     await instance.seed_session(request, seed())
@@ -2550,7 +2562,9 @@ async def test_invalid_judge_verdict_keeps_export_for_rejudging(sandbox_server, 
 
     async def invalid(self, body):
         calls.append(body.deliverables_dir)
-        return GDPValVerifyResponse(**body.model_dump(), reward=0.0, invalid_judge_response=True)
+        return GDPValVerifyResponse(
+            **body.model_dump(), reward=0.0, judge_response=judge_response, invalid_judge_response=True
+        )
 
     monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", invalid)
     verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
@@ -2558,12 +2572,23 @@ async def test_invalid_judge_verdict_keeps_export_for_rejudging(sandbox_server, 
     assert verdict.invalid_judge_response is True
     assert task_attempted(verdict.deliverables_dir)
     assert Path(verdict.deliverables_dir, "report.csv").exists()
+    # Its 0.0 is a placeholder: masked, with the failure metadata Gym expects on a masked row.
+    assert verdict.mask_sample is True
+    assert verdict.failure_kind == failure_kind
+    assert verdict.failure_reason.startswith("judge returned an invalid response")
     # A repeated verify returns the same verdict rather than judging again.
     assert await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request) == verdict
     assert len(calls) == 1
     aggregate = await instance.aggregate_metrics(AggregateMetricsRequest(verify_responses=[verdict.model_dump()]))
     assert aggregate.agent_metrics["rubric/legacy_invalid_rows_excluded"] == 1
     assert aggregate.agent_metrics["rubric/aggregate_rows_included"] == 0
+    # `gym eval profile` measures only the scored row instead of averaging in the placeholder.
+    keys = [{TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: index} for index in range(2)]
+    scored = GDPValVerifyResponse(**row(), response=response(), reward=0.75)
+    results = [scored.model_dump(mode="json") | keys[0], verdict.model_dump(mode="json") | keys[1]]
+    _, measured, masked, _ = select_measured(keys, results)
+    assert [result["reward"] for result in measured] == [0.75]
+    assert masked == [results[1]]
 
 
 async def test_failed_close_retains_handle_for_retry(sandbox_server):

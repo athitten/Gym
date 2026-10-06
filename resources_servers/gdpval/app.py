@@ -67,6 +67,7 @@ from nemo_gym.base_resources_server import (
 from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef
 from nemo_gym.deliverables import IGNORE_FILES
 from nemo_gym.episode_types import EpisodeId
+from nemo_gym.failure_kinds import JUDGE_FAILED, JUDGE_UNPARSEABLE, VERIFIER_ERROR
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_TERMINAL_KEY
 from nemo_gym.sandbox import AsyncSandbox, SandboxSpec, resolve_provider_config
@@ -141,6 +142,17 @@ def _is_invalid_judge_result(judge_result: Any) -> bool:
     if judge_result is None:
         return True
     return isinstance(judge_result, dict) and bool(judge_result.get(SCORING_ERROR_KEY))
+
+
+def _invalid_verdict_failure_kind(scoring_error: Optional[str]) -> str:
+    """Shared failure kind (``nemo_gym.failure_kinds``) for a verdict flagged ``invalid_judge_response``.
+
+    Without a scoring error the judge call failed or returned no text. A scoring error means the judge answered
+    but its reply could not be scored, except a missing rubric, which is a task-data fault.
+    """
+    if scoring_error == "missing_rubric":
+        return VERIFIER_ERROR
+    return JUDGE_UNPARSEABLE if scoring_error else JUDGE_FAILED
 
 
 _DEFAULT_JUDGE_PROMPT_FPATH = str(Path(__file__).parent / "prompts" / "judge_prompt.j2")
@@ -800,9 +812,20 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     "deliverables_dir": str(target),
                 }
             )
-            # An invalid verdict is returned, not raised: the rubric mean excludes it, and its export stays
-            # available for judge-only re-scoring instead of re-running the agent with the same seeded judge.
-            session.verdict = await self._grade_deliverables(payload)
+            verdict = await self._grade_deliverables(payload)
+            if verdict.invalid_judge_response:
+                # Returned, not raised, so the row keeps its export for judge-only re-scoring instead of re-running
+                # the agent with the same seeded judge. Its 0.0 is a placeholder, so the mask keeps reward
+                # profiling and trainers from counting it, as the rubric mean already does.
+                error = (verdict.judge_response or {}).get(SCORING_ERROR_KEY)
+                verdict = verdict.model_copy(
+                    update={
+                        "mask_sample": True,
+                        "failure_kind": _invalid_verdict_failure_kind(error),
+                        "failure_reason": f"judge returned an invalid response: {error or 'no result'}",
+                    }
+                )
+            session.verdict = verdict
             return session.verdict
 
     async def close_resources_session(
@@ -1735,9 +1758,11 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 base = await super().aggregate_metrics(AggregateMetricsRequest(verify_responses=valid_responses))
             else:
                 base = AggregateMetrics()
-            # These describe only the rows supplied to aggregation. Runtime
-            # judge failures live in the collection sidecar and are intentionally
-            # not presented as run-level coverage here.
+            # These describe only the rows supplied to aggregation. Sandbox
+            # sessions return invalid verdicts as masked rows, so those are
+            # counted here, while Stirrup sends its invalid verdicts to the
+            # failures sidecar. The "legacy" key name predates sandbox sessions
+            # and is kept for compatibility.
             coverage: Dict[str, Any] = {
                 "rubric/aggregate_rows_total": total_count,
                 "rubric/aggregate_rows_included": valid_count,

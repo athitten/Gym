@@ -674,8 +674,9 @@ After `gym eval run` returns, the resources server's
 - Rubric mode: `mean/reward` (pass@1 equivalent), computed over rows with a
   usable judge response. Rows flagged `invalid_judge_response` are left out and
   counted in `rubric/aggregate_rows_total`, `rubric/aggregate_rows_included`,
-  `rubric/legacy_invalid_rows_excluded` and
-  `rubric/aggregate_rows_included_fraction`.
+  `rubric/legacy_invalid_rows_excluded` (the `legacy` in the name is historical)
+  and `rubric/aggregate_rows_included_fraction`. Sandbox sessions also set
+  `mask_sample` on those rows, so `gym eval profile` and trainers skip them too.
 - Comparison mode: `comparison/wins`, `comparison/losses`, `comparison/ties`,
   `comparison/judged`, `comparison/win_rate` (omitted when no vote was judged),
   `comparison/eval_elo`, `comparison/normalized_elo`

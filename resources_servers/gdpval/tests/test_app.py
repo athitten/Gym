@@ -2946,6 +2946,11 @@ async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, m
     }
 
 
+def test_export_cap_fits_largest_gdpval_gold_deliverable():
+    # The gold video for task 75401f7c is about 278 MiB; a smaller cap would skip an answer of that size unjudged.
+    assert gdp_app._MAX_EXPORT_BYTES > 279 * 1024 * 1024
+
+
 async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, monkeypatch):
     instance, box, request = sandbox_server
     await instance.seed_session(request, seed())

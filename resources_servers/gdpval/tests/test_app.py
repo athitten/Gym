@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import ClientResponseError
+from aiohttp import ClientPayloadError, ClientResponseError
 from fastapi import HTTPException
 from pydantic import ValidationError
 
@@ -2414,10 +2414,13 @@ async def test_reference_failure_stops_sandbox_and_never_exposes_access(sandbox_
 
 
 def _reference_download(*results):
-    """Fake http_request: each result is response bytes or an HTTP status to raise."""
+    """Fake http_request: each result is response bytes, an HTTP status to raise, or (partial bytes, error)."""
 
     def respond(result):
         async def chunks(*args):
+            if isinstance(result, tuple):
+                yield result[0]
+                raise result[1]
             yield result
 
         failure = None
@@ -2436,6 +2439,11 @@ def _seed_with_reference():
     body = seed()
     body.task_data.update(reference_files=["a.xlsx"], reference_file_urls=["https://example.com/a.xlsx"])
     return body
+
+
+def test_reference_cap_fits_largest_gdpval_reference():
+    # TWT_A001_03.mp4 for task a941b6d8 is 689,061,330 bytes; a smaller cap makes that task unrunnable.
+    assert gdp_app._MAX_REFERENCE_BYTES > 689_061_330
 
 
 async def test_reference_over_size_limit_fails_terminally(sandbox_server, monkeypatch):
@@ -2461,17 +2469,46 @@ async def test_reference_download_retries_transient_errors(sandbox_server, monke
     await instance.seed_session(request, _seed_with_reference())
     assert box.files["/workspace/input/a.xlsx"] == b"reference"
     assert download.await_count == 2
-    assert all(call.kwargs["_max_connection_retries"] == 5 for call in download.await_args_list)
+    # The download loop owns retries; request() itself makes one try per attempt.
+    assert all(call.kwargs["_max_connection_retries"] == 1 for call in download.await_args_list)
 
 
 async def test_reference_download_does_not_retry_missing_files(sandbox_server, monkeypatch):
     instance, box, request = sandbox_server
     download = _reference_download(404)
     monkeypatch.setattr(gdp_app, "http_request", download)
-    with pytest.raises(ClientResponseError):
+    with pytest.raises(HTTPException) as raised:
         await instance.seed_session(request, _seed_with_reference())
+    assert raised.value.status_code == 424  # Terminal for the Environment Server.
     assert download.await_count == 1
     box.stop.assert_awaited_once()
+
+
+async def test_reference_download_gives_up_with_retryable_status(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(503, 503, 503, 503)
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    assert raised.value.status_code == 503  # Retryable: a later episode attempt may succeed.
+    assert download.await_count == gdp_app._REFERENCE_DOWNLOAD_ATTEMPTS
+    box.serialize.assert_not_awaited()
+
+
+async def test_interrupted_reference_download_is_rewritten(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(b"first", (b"sec", ClientPayloadError("connection lost")), b"second")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    body = seed()
+    body.task_data.update(
+        reference_files=["a.xlsx", "b.xlsx"],
+        reference_file_urls=["https://example.com/a.xlsx", "https://example.com/b.xlsx"],
+    )
+    await instance.seed_session(request, body)
+    assert box.files["/workspace/input/a.xlsx"] == b"first"
+    assert box.files["/workspace/input/b.xlsx"] == b"second"
 
 
 async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server, monkeypatch):

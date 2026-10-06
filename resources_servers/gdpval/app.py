@@ -700,13 +700,13 @@ class GDPValResourcesServer(SimpleResourcesServer):
         """Download one reference file, retrying throttling and transient failures a few times."""
         for attempt in range(1, _REFERENCE_DOWNLOAD_ATTEMPTS + 1):
             try:
-                # Bound connects and idle reads rather than the whole transfer: large files take minutes on a slow
-                # link. Bounded connection retries keep an unreachable host from holding the seed indefinitely.
+                # Idle reads are bounded separately from the whole attempt: large files take minutes on a slow link.
+                # This loop owns the retries, so request() makes a single try per attempt.
                 response = await http_request(
                     "GET",
                     url,
                     timeout=ClientTimeout(total=1800, sock_connect=60, sock_read=300),
-                    _max_connection_retries=5,
+                    _max_connection_retries=1,
                 )
                 try:
                     response.raise_for_status()
@@ -722,10 +722,15 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 finally:
                     response.release()
             except (ClientResponseError, ClientConnectionError, ClientPayloadError, TimeoutError) as error:
+                # Report failures as HTTP errors: a bare aiohttp error would reach the caller as a generic 500.
                 status = getattr(error, "status", None)
-                transient = status is None or status in (408, 429) or status >= 500
-                if not transient or attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
-                    raise
+                if status is not None and status not in (408, 429) and status < 500:
+                    # A missing or forbidden file fails the same way on every retry, so the status is terminal.
+                    raise HTTPException(424, f"Reference download failed with HTTP {status}: {url}") from error
+                if attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
+                    raise HTTPException(
+                        503, f"Reference download failed after {attempt} attempts: {error!r}"
+                    ) from error
                 LOGGER.warning("Reference download attempt %d failed for %s: %r", attempt, url, error)
                 await asyncio.sleep(_REFERENCE_RETRY_BASE_DELAY_S * 2 ** (attempt - 1))
 

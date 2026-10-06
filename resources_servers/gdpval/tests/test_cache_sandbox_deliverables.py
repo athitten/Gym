@@ -98,6 +98,8 @@ def test_export_without_marker_fails_the_build(tmp_path, capsys):
     with pytest.raises(SystemExit) as raised:
         main(["--rollouts", str(rollouts), "--output", str(tmp_path / "cache")])
     assert "['t2', 't3']" in str(raised.value.code)
+    # Rows from runs that predate the marker are the other common cause.
+    assert "before the GDPVal server started writing" in str(raised.value.code)
     assert json.loads(capsys.readouterr().out) == {
         "cached": {"count": 1, "task_ids": ["t1"]},
         "skipped_without_export": {"count": 1, "task_ids": ["t4"]},

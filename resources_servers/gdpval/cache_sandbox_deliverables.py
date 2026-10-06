@@ -85,7 +85,8 @@ def main(argv: list[str] | None = None) -> None:
     if unmarked:
         raise SystemExit(
             f"{len(unmarked)} rollout(s) point at a deliverables_dir without {MARKER}, so judge-only scoring would "
-            f"report their tasks as missing: {unmarked}. Check that those exports exist and are readable here."
+            f"report their tasks as missing: {unmarked}. Check that those exports exist and are readable here. "
+            f"Exports made before the GDPVal server started writing {MARKER} never have one."
         )
 
 

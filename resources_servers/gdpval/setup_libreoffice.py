@@ -126,15 +126,49 @@ def _write_probe_workbook(path: Path) -> None:
     workbook.save(path)
 
 
-def _command_works(libreoffice_command: Sequence[str]) -> bool:
+def _probe_converts(libreoffice_command: Sequence[str], root: Path | None) -> bool:
+    """Convert a probe workbook in place, in a fresh directory under *root* (the temp directory when None).
+
+    This is one LibreOffice run, like the first attempt of every real conversion. ``convert_to_pdf`` would retry
+    a workbook it could not convert from a copy in the temp directory, which hides a command that cannot see *root*.
+    """
+    from resources_servers.gdpval.preconvert import libreoffice_pdf_argv
+
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+    probe_dir = Path(tempfile.mkdtemp(prefix="gdpval-lo-probe-", dir=root))
+    profile_dir = Path(tempfile.mkdtemp(prefix="lo-profile-"))
+    try:
+        probe = probe_dir / "probe.xlsx"
+        _write_probe_workbook(probe)
+        argv = libreoffice_pdf_argv(probe, probe_dir, profile_dir, libreoffice_command)
+        try:
+            rc, _, err = _run(argv, timeout=_COMMAND_CHECK_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+            rc, err = None, repr(exc)
+        pdf = probe.with_suffix(".pdf")
+        if pdf.is_file() and pdf.read_bytes().startswith(b"%PDF"):
+            return True
+        LOGGER.warning(
+            "libreoffice_command %s did not convert a probe workbook in %s (rc=%s): %s",
+            libreoffice_command,
+            probe_dir,
+            rc,
+            (err or "").strip()[:300],
+        )
+        return False
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _command_works(libreoffice_command: Sequence[str], probe_dirs: Sequence[Path] = ()) -> bool:
     """Return True iff *libreoffice_command* runs and converts a probe workbook to PDF.
 
-    The probe goes through ``convert_to_pdf`` in the temp directory that real
-    conversions use, so a container command that cannot see that directory
-    fails here instead of on every task.
+    The probe converts a workbook in the temp directory that real conversions
+    use and under each of *probe_dirs*, so a container command that cannot see
+    one of them fails here instead of on every task.
     """
-    from resources_servers.gdpval.preconvert import convert_to_pdf
-
     try:
         rc, out, err = _run([*libreoffice_command, "--version"], timeout=_COMMAND_CHECK_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -149,31 +183,19 @@ def _command_works(libreoffice_command: Sequence[str]) -> bool:
         )
         return False
 
-    probe_dir = Path(tempfile.mkdtemp(prefix="gdpval-lo-probe-"))
-    try:
-        probe = probe_dir / "probe.xlsx"
-        _write_probe_workbook(probe)
-        _, ok, message = convert_to_pdf(probe, libreoffice_command=libreoffice_command)
-        if not ok or not probe.with_suffix(".pdf").read_bytes().startswith(b"%PDF"):
-            LOGGER.warning(
-                "libreoffice_command %s did not convert a probe workbook in %s: %s",
-                libreoffice_command,
-                probe_dir,
-                message,
-            )
-            return False
-    finally:
-        shutil.rmtree(probe_dir, ignore_errors=True)
+    if not all(_probe_converts(libreoffice_command, root) for root in (None, *probe_dirs)):
+        return False
     LOGGER.info("libreoffice_command ready: %s", out.strip())
     return True
 
 
-def ensure_libreoffice(libreoffice_command: Sequence[str] | None = None) -> bool:
+def ensure_libreoffice(libreoffice_command: Sequence[str] | None = None, *, probe_dirs: Sequence[Path] = ()) -> bool:
     """Make sure libreoffice + a *functional* JRE are present on Linux.
 
     With *libreoffice_command* (e.g. a container prefix), only that command is
-    checked, by ``--version`` and a real conversion; the host packages, javaldx
-    and apt below are not used.
+    checked, by ``--version`` and a real conversion in the temp directory and
+    under each of *probe_dirs*; the host packages, javaldx and apt below are not
+    used. *probe_dirs* is ignored for the host ``libreoffice``, which sees every path.
 
     Returns True if libreoffice + a usable JRE are available after the call.
 
@@ -193,7 +215,7 @@ def ensure_libreoffice(libreoffice_command: Sequence[str] | None = None) -> bool
     per-file errors via ``preconvert.py``.
     """
     if libreoffice_command is not None:
-        return _command_works(libreoffice_command)
+        return _command_works(libreoffice_command, probe_dirs)
 
     if not sys.platform.startswith("linux"):
         LOGGER.warning(

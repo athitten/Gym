@@ -608,7 +608,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
         if self.config.libreoffice_command is not None:
             from resources_servers.gdpval.setup_libreoffice import ensure_libreoffice
 
-            if not ensure_libreoffice(self.config.libreoffice_command):
+            # Also probe where sandbox exports land: a command that cannot see them falls back to text on every task.
+            probe_dirs = [self.config.deliverables_root] if self.config.deliverables_root is not None else []
+            if not ensure_libreoffice(self.config.libreoffice_command, probe_dirs=probe_dirs):
                 raise RuntimeError(
                     f"libreoffice_command {self.config.libreoffice_command} failed its startup check "
                     "(--version and a probe conversion; see the warning above). The command must see "

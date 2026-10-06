@@ -44,11 +44,16 @@ def template_pdf(tmp_path: Path) -> Path:
     return path
 
 
-def _converter(directory: Path, template: Path, name: str = "fake-lo", *, converts=True, version_rc=0):
-    """Write an executable that logs argv and writes ``<outdir>/<stem>.pdf`` like LibreOffice."""
+def _converter(directory: Path, template: Path, name: str = "fake-lo", *, converts=True, version_rc=0, unseen=None):
+    """Write an executable that logs argv and writes ``<outdir>/<stem>.pdf`` like LibreOffice.
+
+    Files under *unseen* produce nothing, like a container started without a bind for that directory.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     log = directory / f"{name}.log"
     convert = f"cp '{template}' \"$outdir/${{base%.*}}.pdf\"" if converts else ":"
+    if unseen is not None:
+        convert = f"case \"$src\" in '{unseen}'/*) exit 0 ;; esac\n{convert}"
     script = directory / name
     script.write_text(
         _SCRIPT.replace("@LOG@", str(log)).replace("@VERSION_RC@", str(version_rc)).replace("@CONVERT@", convert)
@@ -107,6 +112,44 @@ def test_ensure_rejects_command_whose_output_is_not_a_pdf(tmp_path):
 
     assert setup_libreoffice.ensure_libreoffice([str(script)]) is False
     assert len(_calls(log)) == 2
+
+
+def test_ensure_probes_every_directory_the_command_must_see(tmp_path, template_pdf):
+    unbound = tmp_path / "exports"
+    script, _ = _converter(tmp_path / "bin", template_pdf, unseen=unbound)
+
+    # The temp-directory probe alone cannot tell that the command misses this directory.
+    assert setup_libreoffice.ensure_libreoffice([str(script)]) is True
+    assert setup_libreoffice.ensure_libreoffice([str(script)], probe_dirs=[unbound]) is False
+    assert list(unbound.iterdir()) == []
+
+
+@pytest.mark.parametrize("sees_exports", [True, False])
+def test_sandbox_server_startup_probes_deliverables_root(tmp_path, template_pdf, sees_exports):
+    from unittest.mock import MagicMock
+
+    from nemo_gym.server_utils import ServerClient
+    from resources_servers.gdpval.app import GDPValResourcesServer, GDPValResourcesServerConfig
+
+    exports = tmp_path / "exports"
+    script, _ = _converter(tmp_path / "bin", template_pdf, unseen=None if sees_exports else exports)
+    config = GDPValResourcesServerConfig(
+        host="127.0.0.1",
+        port=8000,
+        name="resources",
+        entrypoint="app.py",
+        sandbox_provider="sandbox",
+        num_workers=1,
+        image="test-only",
+        deliverables_root=exports,
+        libreoffice_command=[str(script)],
+        judge_model_server={"type": "responses_api_models", "name": "judge"},
+    )
+    if sees_exports:
+        GDPValResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    else:
+        with pytest.raises(RuntimeError, match="failed its startup check"):
+            GDPValResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
 
 def test_ensure_rejects_missing_command(tmp_path):

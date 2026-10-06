@@ -435,7 +435,8 @@ class TestApp:
             # Unlike the host default, an explicit command that fails is a deployment error.
             with pytest.raises(RuntimeError, match="libreoffice_command"):
                 _server(reward_mode="rubric", libreoffice_command=["/opt/lo-wrapper"])
-        ensure.assert_called_once_with(["/opt/lo-wrapper"])
+        # A stateless server has no deliverables_root to probe.
+        ensure.assert_called_once_with(["/opt/lo-wrapper"], probe_dirs=[])
 
     def test_empty_libreoffice_command_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="libreoffice_command"):

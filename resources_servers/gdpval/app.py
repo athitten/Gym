@@ -47,7 +47,7 @@ from pathlib import Path
 from shlex import quote
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
-from aiohttp import ClientTimeout
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, ClientTimeout
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from typing_extensions import Self
@@ -85,6 +85,10 @@ from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, G
 
 LOGGER = logging.getLogger(__name__)
 _MAX_BYTES = 128 * 1024 * 1024
+# Per reference file. The largest GDPVal reference is about 660 MiB (task a941b6d8).
+_MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
+_REFERENCE_DOWNLOAD_ATTEMPTS = 4
+_REFERENCE_RETRY_BASE_DELAY_S = 2.0
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
@@ -665,21 +669,43 @@ class GDPValResourcesServer(SimpleResourcesServer):
 
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
         with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:
+            local = Path(scratch) / "reference"
             for name, url in zip(task.reference_files, task.reference_file_urls, strict=True):
-                response = await http_request("GET", url, timeout=ClientTimeout(total=180))
+                await self._download_reference(url, local)
+                await sandbox.upload(local, f"{INPUT_DIR}/{name}")
+
+    async def _download_reference(self, url: str, local: Path) -> None:
+        """Download one reference file, retrying throttling and transient failures a few times."""
+        for attempt in range(1, _REFERENCE_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                # Bound connects and idle reads rather than the whole transfer: large files take minutes on a slow
+                # link. Bounded connection retries keep an unreachable host from holding the seed indefinitely.
+                response = await http_request(
+                    "GET",
+                    url,
+                    timeout=ClientTimeout(total=1800, sock_connect=60, sock_read=300),
+                    _max_connection_retries=5,
+                )
                 try:
                     response.raise_for_status()
-                    local = Path(scratch) / "reference"
                     size = 0
                     with local.open("wb") as stream:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
                             size += len(chunk)
-                            if size > _MAX_BYTES:
-                                raise RuntimeError("Reference file exceeds prototype download limit")
+                            if size > _MAX_REFERENCE_BYTES:
+                                # A terminal status: retrying the episode cannot make the file smaller.
+                                raise HTTPException(413, f"Reference file exceeds {_MAX_REFERENCE_BYTES} bytes: {url}")
                             stream.write(chunk)
-                    await sandbox.upload(local, f"{INPUT_DIR}/{name}")
+                    return
                 finally:
                     response.release()
+            except (ClientResponseError, ClientConnectionError, ClientPayloadError, TimeoutError) as error:
+                status = getattr(error, "status", None)
+                transient = status is None or status in (408, 429) or status >= 500
+                if not transient or attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
+                    raise
+                LOGGER.warning("Reference download attempt %d failed for %s: %r", attempt, url, error)
+                await asyncio.sleep(_REFERENCE_RETRY_BASE_DELAY_S * 2 ** (attempt - 1))
 
     async def export_deliverables(self, session_id: str) -> Path:
         """Export completed files; caller must have confirmed agent close first."""

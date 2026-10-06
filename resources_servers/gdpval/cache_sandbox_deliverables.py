@@ -35,20 +35,30 @@ def _copy_attempt(source: Path, target: Path, staging_root: Path) -> None:
     staging.rename(target)
 
 
-def build_cache(rollouts: Path, output: Path) -> dict[str, int]:
-    """Copy every completed export listed in *rollouts* into *output*; return copy counts."""
+def build_cache(rollouts: Path, output: Path) -> dict[str, list[str | None]]:
+    """Copy every finished export listed in *rollouts* into *output*; return the task ids of each outcome.
+
+    ``skipped_without_export`` rows recorded no export. ``export_without_marker`` rows point at a directory with no
+    ``finish_params.json`` (moved, deleted or not visible from this host), so judge-only scoring would report those
+    tasks as missing; ``main`` fails on them.
+    """
     output.mkdir(parents=True, exist_ok=True)
     staging_root = output / STAGING
-    counts = {"cached": 0, "skipped_without_export": 0}
+    outcomes: dict[str, list[str | None]] = {"cached": [], "skipped_without_export": [], "export_without_marker": []}
     seen: set[tuple[str, int]] = set()
     try:
         with rollouts.open() as handle:
             for line in handle:
                 row = json.loads(line)
                 task_id, source = row.get("task_id"), row.get("deliverables_dir")
-                if not isinstance(task_id, str) or not source or not (Path(source) / MARKER).is_file():
-                    counts["skipped_without_export"] += 1
+                if not source:
+                    outcomes["skipped_without_export"].append(task_id)
                     continue
+                if not (Path(source) / MARKER).is_file():
+                    outcomes["export_without_marker"].append(task_id)
+                    continue
+                if not isinstance(task_id, str):
+                    raise ValueError(f"Rollout with export {source} has no task_id")
                 index = int(row.get("_ng_rollout_index") or 0)
                 if (task_id, index) in seen:
                     raise ValueError(f"Duplicate rollout for task {task_id} repeat {index}")
@@ -57,10 +67,10 @@ def build_cache(rollouts: Path, output: Path) -> dict[str, int]:
                 if target.exists():
                     raise FileExistsError(f"{target} already exists; use a fresh output directory")
                 _copy_attempt(Path(source), target, staging_root)
-                counts["cached"] += 1
+                outcomes["cached"].append(task_id)
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
-    return counts
+    return outcomes
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -68,7 +78,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rollouts", type=Path, required=True, help="rollouts.jsonl from the sandbox-session run")
     parser.add_argument("--output", type=Path, required=True, help="absolute cache directory to create")
     args = parser.parse_args(argv)
-    print(json.dumps(build_cache(args.rollouts, args.output)))
+    outcomes = build_cache(args.rollouts, args.output)
+    summary = {reason: {"count": len(task_ids), "task_ids": task_ids} for reason, task_ids in outcomes.items()}
+    print(json.dumps(summary))
+    unmarked = outcomes["export_without_marker"]
+    if unmarked:
+        raise SystemExit(
+            f"{len(unmarked)} rollout(s) point at a deliverables_dir without {MARKER}, so judge-only scoring would "
+            f"report their tasks as missing: {unmarked}. Check that those exports exist and are readable here."
+        )
 
 
 if __name__ == "__main__":

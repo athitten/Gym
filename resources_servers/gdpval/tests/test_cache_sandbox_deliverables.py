@@ -35,8 +35,8 @@ def test_cache_matches_judge_only_layout(tmp_path):
             {"task_id": "t2", "_ng_rollout_index": 1, "deliverables_dir": str(second), "reward": 0.0},
         ],
     )
-    counts = build_cache(rollouts, tmp_path / "cache")
-    assert counts == {"cached": 2, "skipped_without_export": 0}
+    outcomes = build_cache(rollouts, tmp_path / "cache")
+    assert outcomes == {"cached": ["t1", "t2"], "skipped_without_export": [], "export_without_marker": []}
     cached = tmp_path / "cache" / "task_t1" / "repeat_0"
     assert sorted(p.name for p in cached.iterdir()) == ["finish_params.json", "report.xlsx"]
     # An attempt that exported nothing is still finished, so it is judged rather than reported missing.
@@ -69,18 +69,49 @@ def test_failed_copy_never_looks_like_an_attempt(tmp_path, monkeypatch):
     assert list((tmp_path / "cache").iterdir()) == []
 
 
-def test_rows_without_completed_export_are_skipped(tmp_path):
-    unfinished = _export(tmp_path / "exports", "gdp-a", {"report.xlsx": "a"}, marker=False)
+def test_rows_without_an_export_are_a_plain_skip(tmp_path, capsys):
+    finished = _export(tmp_path / "exports", "gdp-a", {"report.xlsx": "a"})
+    rollouts = _rollouts(
+        tmp_path / "rollouts.jsonl",
+        [{"task_id": "t1", "deliverables_dir": str(finished)}, {"task_id": "t2"}, {"task_id": "t3"}],
+    )
+    main(["--rollouts", str(rollouts), "--output", str(tmp_path / "cache")])
+    assert json.loads(capsys.readouterr().out) == {
+        "cached": {"count": 1, "task_ids": ["t1"]},
+        "skipped_without_export": {"count": 2, "task_ids": ["t2", "t3"]},
+        "export_without_marker": {"count": 0, "task_ids": []},
+    }
+
+
+def test_export_without_marker_fails_the_build(tmp_path, capsys):
+    finished = _export(tmp_path / "exports", "gdp-a", {"report.xlsx": "a"})
+    unfinished = _export(tmp_path / "exports", "gdp-b", {"report.xlsx": "b"}, marker=False)
     rollouts = _rollouts(
         tmp_path / "rollouts.jsonl",
         [
-            {"task_id": "t1", "deliverables_dir": str(unfinished)},
-            {"task_id": "t2"},
-            {"deliverables_dir": str(unfinished)},
+            {"task_id": "t1", "deliverables_dir": str(finished)},
+            {"task_id": "t2", "deliverables_dir": str(unfinished)},
+            {"task_id": "t3", "deliverables_dir": str(tmp_path / "exports" / "moved")},
+            {"task_id": "t4"},
         ],
     )
-    assert build_cache(rollouts, tmp_path / "cache") == {"cached": 0, "skipped_without_export": 3}
-    assert not (tmp_path / "cache" / "task_t1").exists()
+    with pytest.raises(SystemExit) as raised:
+        main(["--rollouts", str(rollouts), "--output", str(tmp_path / "cache")])
+    assert "['t2', 't3']" in str(raised.value.code)
+    assert json.loads(capsys.readouterr().out) == {
+        "cached": {"count": 1, "task_ids": ["t1"]},
+        "skipped_without_export": {"count": 1, "task_ids": ["t4"]},
+        "export_without_marker": {"count": 2, "task_ids": ["t2", "t3"]},
+    }
+    # Finished exports are still cached; an export without its marker never is.
+    assert sorted(p.name for p in (tmp_path / "cache").iterdir()) == ["task_t1"]
+
+
+def test_finished_export_without_task_id_is_rejected(tmp_path):
+    export = _export(tmp_path / "exports", "gdp-a", {"report.xlsx": "a"})
+    rollouts = _rollouts(tmp_path / "rollouts.jsonl", [{"deliverables_dir": str(export)}])
+    with pytest.raises(ValueError, match="task_id"):
+        build_cache(rollouts, tmp_path / "cache")
 
 
 def test_duplicate_attempt_rejected(tmp_path):

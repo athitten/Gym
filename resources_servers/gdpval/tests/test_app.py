@@ -2504,18 +2504,29 @@ async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server
         await instance.seed_session(request, seed())
 
 
-async def test_invalid_judge_is_retryable_not_zero_reward(sandbox_server, monkeypatch):
+async def test_invalid_judge_verdict_keeps_export_for_rejudging(sandbox_server, monkeypatch):
+    from nemo_gym.config_types import AggregateMetricsRequest
+
     instance, _, request = sandbox_server
     await instance.seed_session(request, seed())
+    calls = []
 
     async def invalid(self, body):
+        calls.append(body.deliverables_dir)
         return GDPValVerifyResponse(**body.model_dump(), reward=0.0, invalid_judge_response=True)
 
     monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", invalid)
-    with pytest.raises(HTTPException) as error:
-        await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
-    assert error.value.status_code == 503
-    assert instance._sessions["resources-1"].verdict is None
+    verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    # The row reaches the rollout file with its export, so judge-only scoring can re-judge it.
+    assert verdict.invalid_judge_response is True
+    assert task_attempted(verdict.deliverables_dir)
+    assert Path(verdict.deliverables_dir, "report.csv").exists()
+    # A repeated verify returns the same verdict rather than judging again.
+    assert await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request) == verdict
+    assert len(calls) == 1
+    aggregate = await instance.aggregate_metrics(AggregateMetricsRequest(verify_responses=[verdict.model_dump()]))
+    assert aggregate.agent_metrics["rubric/legacy_invalid_rows_excluded"] == 1
+    assert aggregate.agent_metrics["rubric/aggregate_rows_included"] == 0
 
 
 async def test_failed_close_retains_handle_for_retry(sandbox_server):

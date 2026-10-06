@@ -795,10 +795,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     "deliverables_dir": str(target),
                 }
             )
-            verdict = await self._grade_deliverables(payload)
-            if verdict.invalid_judge_response:
-                raise HTTPException(503, "GDP judge did not return a valid verdict")
-            session.verdict = verdict
+            # An invalid verdict is returned, not raised: the rubric mean excludes it, and its export stays
+            # available for judge-only re-scoring instead of re-running the agent with the same seeded judge.
+            session.verdict = await self._grade_deliverables(payload)
             return session.verdict
 
     async def close_resources_session(

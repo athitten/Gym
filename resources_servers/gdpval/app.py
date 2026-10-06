@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, ClientTimeout
 from fastapi import FastAPI, HTTPException, Request
+from openai import OpenAIError
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from typing_extensions import Self
 
@@ -80,7 +81,7 @@ from resources_servers.gdpval.judge_panel import (
     make_rng,
     panel_summary,
 )
-from resources_servers.gdpval.scoring import SCORING_ERROR_KEY
+from resources_servers.gdpval.scoring import SCORING_ERROR_KEY, is_permanent_judge_error
 from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, json_list, relative_file
 
 
@@ -832,21 +833,42 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     "deliverables_dir": str(target),
                 }
             )
-            verdict = await self._grade_deliverables(payload)
-            if verdict.invalid_judge_response:
-                # Returned, not raised, so the row keeps its export for judge-only re-scoring instead of re-running
-                # the agent with the same seeded judge. Its 0.0 is a placeholder, so the mask keeps reward
-                # profiling and trainers from counting it, as the rubric mean already does.
-                error = (verdict.judge_response or {}).get(SCORING_ERROR_KEY)
-                verdict = verdict.model_copy(
-                    update={
-                        "mask_sample": True,
-                        "failure_kind": _invalid_verdict_failure_kind(error),
-                        "failure_reason": f"judge returned an invalid response: {error or 'no result'}",
-                    }
-                )
-            session.verdict = verdict
+            session.verdict = await self._grade_session(payload)
             return session.verdict
+
+    async def _grade_session(self, payload: GDPValVerifyRequest) -> GDPValVerifyResponse:
+        """Grade a session export, returning a masked placeholder verdict when judging fails.
+
+        A failed /verify would send the row to the failures sidecar without its export, so judge-only scoring could
+        not re-judge it and a resume would re-run the agent with the same seeded judge. The placeholder keeps
+        ``deliverables_dir``; its 0.0 is masked so reward profiling and trainers skip it, as the rubric mean does.
+        """
+        try:
+            verdict = await self._grade_deliverables(payload)
+        except Exception as error:  # Cancellation is not an Exception, so it still propagates.
+            LOGGER.exception("GDP judging failed for task %s; returning a masked verdict", payload.task_id)
+            # A 413 or context-window judge error fails the same way again; anything else may pass on a retry.
+            permanent = is_permanent_judge_error(error)
+            return GDPValVerifyResponse(
+                **payload.model_dump(),
+                reward=0.0,
+                verify_mode=self.config.reward_mode,
+                invalid_judge_response=True,
+                invalid_judge_retryable=not permanent,
+                mask_sample=True,
+                failure_kind=JUDGE_FAILED if permanent or isinstance(error, OpenAIError) else VERIFIER_ERROR,
+                failure_reason=f"judging raised {type(error).__name__}: {error}"[:2000],
+            )
+        if not verdict.invalid_judge_response:
+            return verdict
+        error = (verdict.judge_response or {}).get(SCORING_ERROR_KEY)
+        return verdict.model_copy(
+            update={
+                "mask_sample": True,
+                "failure_kind": _invalid_verdict_failure_kind(error),
+                "failure_reason": f"judge returned an invalid response: {error or 'no result'}",
+            }
+        )
 
     async def close_resources_session(
         self, request: Request, body: ResourcesCloseSessionRequest

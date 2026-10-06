@@ -21,9 +21,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from aiohttp import ClientPayloadError, ClientResponseError
 from fastapi import HTTPException
+from openai import APIConnectionError, APIStatusError
 from pydantic import ValidationError
 
 from nemo_gym.base_resources_server import ResourcesCloseSessionRequest, ResourcesSeedSessionRequest
@@ -2619,6 +2621,55 @@ async def test_invalid_judge_verdict_keeps_export_for_rejudging(
     _, measured, masked, _ = select_measured(keys, results)
     assert [result["reward"] for result in measured] == [0.75]
     assert masked == [results[1]]
+
+
+async def test_raised_judge_error_keeps_export_as_masked_verdict(sandbox_server, monkeypatch):
+    instance, _, request = sandbox_server
+    await instance.seed_session(request, seed())
+    # The rubric scorers re-raise permanent judge errors such as an oversized request.
+    call = httpx.Request("POST", "http://localhost:9999/v1/chat/completions")
+    too_large = APIStatusError(
+        "Error code: 413 - request too large", response=httpx.Response(413, request=call), body=None
+    )
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(side_effect=too_large)
+    monkeypatch.setattr(gdp_app, "get_server_url", lambda name: "http://localhost:9999")
+    with patch("openai.AsyncOpenAI", return_value=client):
+        verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+        assert await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request) == verdict
+    client.chat.completions.create.assert_awaited_once()
+    assert (verdict.reward, verdict.invalid_judge_response, verdict.invalid_judge_retryable) == (0.0, True, False)
+    assert (verdict.mask_sample, verdict.failure_kind) == (True, "judge_failed")
+    assert "413" in verdict.failure_reason
+    # The export and its marker survive, so judge-only scoring can re-judge this attempt.
+    assert task_attempted(verdict.deliverables_dir)
+    assert Path(verdict.deliverables_dir, "report.csv").read_bytes() == b"name,value\na,3\n"
+
+
+@pytest.mark.parametrize(
+    ("error", "failure_kind"),
+    [
+        (APIConnectionError(request=httpx.Request("POST", "http://judge/v1/chat/completions")), "judge_failed"),
+        (ValueError("unreadable deliverable"), "verifier_error"),
+    ],
+)
+async def test_raised_scoring_error_is_a_retryable_masked_verdict(sandbox_server, monkeypatch, error, failure_kind):
+    instance, _, request = sandbox_server
+    await instance.seed_session(request, seed())
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", AsyncMock(side_effect=error))
+    verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    assert (verdict.mask_sample, verdict.invalid_judge_retryable, verdict.failure_kind) == (True, True, failure_kind)
+    assert task_attempted(verdict.deliverables_dir)
+
+
+async def test_cancelled_judging_propagates_and_caches_no_verdict(sandbox_server, monkeypatch):
+    instance, _, request = sandbox_server
+    await instance.seed_session(request, seed())
+    grade = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    with pytest.raises(asyncio.CancelledError):
+        await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    assert instance._sessions["resources-1"].verdict is None
 
 
 async def test_failed_close_retains_handle_for_retry(sandbox_server):

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import ClientResponseError
 from fastapi import HTTPException
 from pydantic import ValidationError
 
@@ -2410,6 +2411,67 @@ async def test_reference_failure_stops_sandbox_and_never_exposes_access(sandbox_
     box.stop.assert_awaited_once()
     box.serialize.assert_not_awaited()
     assert SESSION_ID_KEY not in request.session
+
+
+def _reference_download(*results):
+    """Fake http_request: each result is response bytes or an HTTP status to raise."""
+
+    def respond(result):
+        async def chunks(*args):
+            yield result
+
+        failure = None
+        if isinstance(result, int):
+            failure = ClientResponseError(MagicMock(), (), status=result, message="upstream error")
+        return SimpleNamespace(
+            raise_for_status=MagicMock(side_effect=failure),
+            release=MagicMock(),
+            content=SimpleNamespace(iter_chunked=chunks),
+        )
+
+    return AsyncMock(side_effect=[respond(result) for result in results])
+
+
+def _seed_with_reference():
+    body = seed()
+    body.task_data.update(reference_files=["a.xlsx"], reference_file_urls=["https://example.com/a.xlsx"])
+    return body
+
+
+async def test_reference_over_size_limit_fails_terminally(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    monkeypatch.setattr(gdp_app, "_MAX_REFERENCE_BYTES", 4)
+    download = _reference_download(b"12345")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    # A 4xx other than 408/425/429 is terminal for the Environment Server, so the episode is not re-run.
+    assert raised.value.status_code == 413
+    assert download.await_count == 1
+    box.stop.assert_awaited_once()
+    box.serialize.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_reference_download_retries_transient_errors(sandbox_server, monkeypatch, status):
+    instance, box, request = sandbox_server
+    download = _reference_download(status, b"reference")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    await instance.seed_session(request, _seed_with_reference())
+    assert box.files["/workspace/input/a.xlsx"] == b"reference"
+    assert download.await_count == 2
+    assert all(call.kwargs["_max_connection_retries"] == 5 for call in download.await_args_list)
+
+
+async def test_reference_download_does_not_retry_missing_files(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(404)
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    with pytest.raises(ClientResponseError):
+        await instance.seed_session(request, _seed_with_reference())
+    assert download.await_count == 1
+    box.stop.assert_awaited_once()
 
 
 async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server, monkeypatch):

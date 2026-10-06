@@ -232,6 +232,33 @@ gym eval run \
   The cache must contain a `task_<id>/repeat_<n>/` dir for every repeat the run
   requests (the benchmark defaults to `num_repeats: 1`, i.e. `repeat_0`; raise it
   with `++...datasets.0.num_repeats=N` and the cache needs `repeat_0`…`repeat_{N-1}`).
+- **Sandbox sessions** (for example Pi with
+  `resources_servers/gdpval/configs/gdpval_pi_sandbox.yaml`): each rollout row
+  points at its export under `deliverables_root`. Copy the exports into the
+  cache layout, then run the judge-only command above on that cache:
+
+```bash
+python -m resources_servers.gdpval.cache_sandbox_deliverables \
+    --rollouts results/gdpval_pi.jsonl --output /abs/path/to/deliverables_cache
+```
+
+  Rows without an export are skipped. The command fails and lists the task ids
+  when a row's `deliverables_dir` has no `finish_params.json`, because
+  judge-only scoring would report those tasks as missing.
+
+Notes for judge-only runs:
+
+- The policy is never called, but `gym eval run` still waits for its endpoint.
+  With a placeholder policy, add `++model_endpoint_readiness_timeout_seconds=0`.
+- Serve mode rejects `-i/--input` and always reads the prepared split. To judge
+  fewer tasks, pass `++multistage.dataset_path=<subset.jsonl>`. If you also set
+  `++multistage.distribution_path`, use a new file: an existing one is reused
+  as is.
+- To replace the judge panel or judge endpoint with a config file, load the
+  benchmark with `--config benchmarks/gdpval/config.yaml` before your file,
+  not with `--benchmark gdpval`. The CLI adds `--benchmark` after every
+  `--config`, so the benchmark's judge defaults would override your panel.
+  Command-line `++` overrides are not affected.
 
 ### Full run as a single stage
 
@@ -511,6 +538,7 @@ Fields on `gdpval_resources_server.resources_servers.gdpval`:
 | `count_eval_missing_as_loss`, `missing_eval_task_ids` | `false`, `[]` | Comparison, multi-stage `stage_index` 1 only (indices start at 0): a listed task whose eval deliverable has no `finish_params.json` is scored as a loss against every reference instead of failing. Set the same two fields on `gdpval_stirrup_agent` so judge-only runs forward those tasks to the resources server. |
 | `judge_handles_audio`, `judge_handles_video` | `false` | Audio/video capability of the single judge when `judge_panel` is `null`. |
 | `on_missing_av_judge` | `warn` | See [Audio / video routing](#audio--video-routing). |
+| `libreoffice_command` | unset (`libreoffice` on `PATH`) | Command list that replaces the host `libreoffice` for every Office-to-PDF conversion, e.g. `[apptainer, exec, --bind, /lustre, --bind, /tmp, /path/to/gdpval.sif, libreoffice]` to use the GDP image. It must see `TMPDIR` and the deliverable and reference directories (such as `deliverables_root`) at the same paths. Startup checks it with `--version` and a probe conversion and fails if either fails. |
 
 Comparison requests are also bounded by these environment variables (defaults in
 MiB): `GDPVAL_MAX_FILE_BYTES_FOR_JUDGE` (250),
@@ -655,14 +683,19 @@ Kimi-K2.6 vLLM engine with its vision tower as the single judge
 copy of the weights instead of `moonshotai/Kimi-K2.6`.
 
 ```bash
-gym eval run --benchmark gdpval --model-type vllm_model \
+gym eval run \
+    --config benchmarks/gdpval/config.yaml \
     --config resources_servers/gdpval/configs/gdpval_kimi_local_judge.yaml \
+    --model-type vllm_model \
     --split benchmark --output results/gdpval_kimi_judge.jsonl \
     ++gdpval_resources_server.resources_servers.gdpval.reward_mode=comparison \
     ++gdpval_resources_server.resources_servers.gdpval.reference_models...=...
 ```
 
-The same page-cap notes apply as for MiniMax-M3. The benchmark's four OpenAI
+Load the benchmark with `--config` before the overlay: with `--benchmark gdpval`
+the benchmark's panel replaces this judge (see
+[Fresh vs. cached deliverables](#fresh-vs-cached-deliverables)). The same
+page-cap notes apply as for MiniMax-M3. The benchmark's four OpenAI
 judge proxies start idle; drop them with `~<name>` if you want a clean run.
 
 ## Aggregate metrics

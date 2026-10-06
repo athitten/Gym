@@ -3063,6 +3063,20 @@ async def test_skipped_record_keeps_the_first_entries_and_counts_all(sandbox_ser
     assert f"skipped {len(names)} entries: {kept}" in warning
 
 
+async def test_file_changed_between_listing_and_copy_fails_the_export(sandbox_server):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    # The listing saw 3 bytes, but the file had changed by the time it was copied.
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(("report.csv", 3, True))
+    with pytest.raises(HTTPException, match="changed during export") as error:
+        await instance.export_deliverables("resources-1")
+    assert error.value.status_code == 503
+    # Without the marker the partial copy is never judged or cached, and a retry exports again.
+    assert not list(instance.config.deliverables_root.glob("gdp-*/finish_params.json"))
+    assert instance._sessions["resources-1"].deliverables is None
+
+
 @pytest.mark.parametrize(
     "listing",
     [

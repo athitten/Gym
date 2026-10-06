@@ -99,6 +99,16 @@ def test_ensure_rejects_command_that_fails(tmp_path, template_pdf, converts, ver
     assert setup_libreoffice.ensure_libreoffice([str(script)]) is False
 
 
+def test_ensure_rejects_command_whose_output_is_not_a_pdf(tmp_path):
+    # A converter can exit 0 and leave a .pdf that is really an error page; the probe checks the bytes.
+    not_pdf = tmp_path / "error-page.html"
+    not_pdf.write_text("<html>conversion failed</html>")
+    script, log = _converter(tmp_path / "bin", not_pdf)
+
+    assert setup_libreoffice.ensure_libreoffice([str(script)]) is False
+    assert len(_calls(log)) == 2
+
+
 def test_ensure_rejects_missing_command(tmp_path):
     assert setup_libreoffice.ensure_libreoffice([str(tmp_path / "missing")]) is False
 

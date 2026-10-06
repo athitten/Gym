@@ -2290,7 +2290,7 @@ class Sandbox:
 
     async def execute(self, command, **kwargs):
         files = [
-            {"name": key.removeprefix("/workspace/output/"), "size": len(value)}
+            {"name": key.removeprefix("/workspace/output/"), "size": len(value), "regular": True}
             for key, value in self.files.items()
             if key.startswith("/workspace/output/")
         ]
@@ -2699,7 +2699,7 @@ def test_config_rejects_relative_output_and_multiple_workers(sandbox_server):
 
 
 @pytest.mark.parametrize("kind", ["file", "symlink", "directory", "hardlink"])
-def test_actual_export_listing_rejects_nonregular_deliverables(tmp_path, kind):
+def test_actual_export_listing_flags_nonregular_deliverables(tmp_path, kind):
     output = tmp_path / "output"
     output.mkdir()
     candidate = output / "report.csv"
@@ -2715,12 +2715,26 @@ def test_actual_export_listing_rejects_nonregular_deliverables(tmp_path, kind):
         candidate.hardlink_to(outside)
     script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    [entry] = json.loads(result.stdout)
+    assert entry["name"] == "report.csv"
+    assert entry["regular"] is (kind == "file")
     if kind == "file":
-        assert result.returncode == 0
-        assert json.loads(result.stdout) == [{"name": "report.csv", "size": 8}]
-    else:
-        assert result.returncode != 0
-        assert "Only regular" in result.stderr
+        assert entry["size"] == 8
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink"])
+def test_actual_export_listing_ignores_unusable_output_directory(tmp_path, kind):
+    output = tmp_path / "output"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.csv").write_bytes(b"secret")
+    if kind == "symlink":
+        output.symlink_to(outside)
+    script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
 
 
 def test_app_http_sandbox_lifecycle_uses_seeded_metadata(sandbox_server, monkeypatch):
@@ -2786,9 +2800,81 @@ async def test_export_writes_completion_marker_and_skips_run_state_files(sandbox
     box.files["/workspace/output/history.json"] = b"{}"
     target = await instance.export_deliverables("resources-1")
     assert sorted(p.name for p in target.iterdir()) == ["finish_params.json", "report.csv"]
-    assert json.loads((target / "finish_params.json").read_text()) == {"paths": ["report.csv"]}
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": ["report.csv"],
+        "skipped": [
+            {"name": "finish_params.json", "reason": "reserved run-state name"},
+            {"name": "history.json", "reason": "reserved run-state name"},
+        ],
+    }
     assert task_attempted(str(target))
     assert not list(instance.config.deliverables_root.glob("*.tmp"))
+
+
+def _listing(*entries):
+    """Sandbox exec result for the output listing: (name, size, regular) tuples."""
+    rows = [{"name": name, "size": size, "regular": regular} for name, size, regular in entries]
+    return SimpleNamespace(return_code=0, stdout=json.dumps(rows), stderr="")
+
+
+async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.files["/workspace/output/a\\b.txt"] = b"x"
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(
+        ("a\\b.txt", 1, True), ("charts", 4096, False), ("link.csv", 9, False), ("report.csv", 15, True)
+    )
+    graded = []
+
+    async def grade(self, body):
+        graded.append(sorted(p.name for p in Path(body.deliverables_dir).iterdir()))
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.5)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    assert verdict.reward == 0.5
+    assert graded == [["finish_params.json", "report.csv"]]
+    marker = json.loads((instance._sessions["resources-1"].deliverables / "finish_params.json").read_text())
+    assert marker == {
+        "paths": ["report.csv"],
+        "skipped": [
+            {"name": "a\\b.txt", "reason": "unsupported file name"},
+            {"name": "charts", "reason": "not a regular file"},
+            {"name": "link.csv", "reason": "not a regular file"},
+        ],
+    }
+
+
+async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    monkeypatch.setattr(gdp_app, "_MAX_EXPORT_FILES", 2)
+    monkeypatch.setattr(gdp_app, "_MAX_EXPORT_BYTES", 10)
+    for name, size in (("a.txt", 4), ("b.txt", 8), ("c.txt", 3), ("d.txt", 1)):
+        box.files[f"/workspace/output/{name}"] = b"x" * size
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(("a.txt", 4, True), ("b.txt", 8, True), ("c.txt", 3, True), ("d.txt", 1, True))
+    target = await instance.export_deliverables("resources-1")
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": ["a.txt", "c.txt"],
+        "skipped": [{"name": "b.txt", "reason": "size limit"}, {"name": "d.txt", "reason": "file count limit"}],
+    }
+    assert sorted(p.name for p in target.iterdir()) == ["a.txt", "c.txt", "finish_params.json"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{"name": "a.txt", "size": 1}, {"name": "a.txt", "size": -1, "regular": True}, {"name": 3, "regular": True}],
+)
+async def test_malformed_output_listing_is_an_export_failure(sandbox_server, entry):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.exec.side_effect = None
+    box.exec.return_value = SimpleNamespace(return_code=0, stdout=json.dumps([entry]), stderr="")
+    with pytest.raises(HTTPException) as error:
+        await instance.export_deliverables("resources-1")
+    assert error.value.status_code == 503
 
 
 def _reference_models(root):

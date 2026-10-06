@@ -84,26 +84,48 @@ from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, G
 
 
 LOGGER = logging.getLogger(__name__)
-_MAX_BYTES = 128 * 1024 * 1024
+# Per attempt. Two GDPVal gold deliverables exceed 128 MiB (a 171 MiB zip and a 278 MiB video).
+_MAX_EXPORT_BYTES = 1024 * 1024 * 1024
+_MAX_EXPORT_FILES = 100
 # Per reference file. The largest GDPVal reference is about 660 MiB (task a941b6d8).
 _MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
 _REFERENCE_DOWNLOAD_ATTEMPTS = 4
 _REFERENCE_RETRY_BASE_DELAY_S = 2.0
+# Lists the top-level entries the export may copy; a missing or symlinked output directory lists nothing.
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
-if root.is_symlink() or not root.is_dir():
-    raise RuntimeError('Output directory is missing or a symlink')
-files = []
-for path in sorted(root.iterdir()):
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise RuntimeError('Only regular, non-linked files directly in output are supported')
-    files.append({{'name': path.name, 'size': info.st_size}})
-if len(files) > 100 or sum(item['size'] for item in files) > {_MAX_BYTES}:
-    raise RuntimeError('Deliverable limit exceeded')
-print(json.dumps(files))
+entries = []
+if root.is_dir() and not root.is_symlink():
+    for path in sorted(root.iterdir()):
+        info = path.lstat()
+        regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
+print(json.dumps(entries))
 """
+
+
+def _export_skip_reason(item: Dict[str, Any], exported: int, total: int) -> Optional[str]:
+    """Why a listed output entry is not exported, or None when it is.
+
+    The model owns the output layout, so an entry the judge cannot read is skipped and recorded rather than
+    failed as an infrastructure error. Judges read only top-level regular files.
+    """
+    if item["name"] in IGNORE_FILES:
+        return "reserved run-state name"
+    if item["regular"] is not True:
+        return "not a regular file"
+    try:
+        plain = "/" not in relative_file(item["name"])
+    except ValueError:
+        plain = False
+    if not plain:
+        return "unsupported file name"
+    if exported >= _MAX_EXPORT_FILES:
+        return "file count limit"
+    if total + item["size"] > _MAX_EXPORT_BYTES:
+        return "size limit"
+    return None
 
 
 def _is_invalid_judge_result(judge_result: Any) -> bool:
@@ -717,33 +739,40 @@ class GDPValResourcesServer(SimpleResourcesServer):
         result = await session.sandbox.exec(f"python3 -c {quote(_LIST_OUTPUTS)}", timeout_s=60)
         if result.return_code != 0:
             raise HTTPException(503, "GDP artifact export failed: " + (result.stderr or "listing failed")[-1000:])
-        files = json.loads(result.stdout)
-        if not isinstance(files, list) or len(files) > 100:
+        entries = json.loads(result.stdout)
+        if not isinstance(entries, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("size"), int)
+            and item["size"] >= 0
+            and isinstance(item.get("regular"), bool)
+            for item in entries
+        ):
             raise HTTPException(503, "Invalid GDP artifact listing")
         self.config.deliverables_root.mkdir(parents=True, exist_ok=True)
         # An attempt gets a fresh directory. Never delete or overwrite another attempt's files.
         target = Path(tempfile.mkdtemp(prefix="gdp-", dir=self.config.deliverables_root))
         total = 0
         exported = []
-        for item in files:
-            name = relative_file(item["name"])
-            if "/" in name or not isinstance(item["size"], int) or item["size"] < 0:
-                raise HTTPException(503, "Invalid GDP artifact entry")
-            if name in IGNORE_FILES:
-                # Run-state names are never graded, and the completion marker below must come from this server.
+        skipped = []
+        for item in entries:
+            reason = _export_skip_reason(item, len(exported), total)
+            if reason is not None:
+                skipped.append({"name": item["name"], "reason": reason})
                 continue
-            total += item["size"]
-            if total > _MAX_BYTES:
-                raise HTTPException(503, "GDP artifact size limit exceeded")
+            name = item["name"]
             await session.sandbox.download(f"{OUTPUT_DIR}/{name}", target / name)
             if (target / name).stat().st_size != item["size"]:
                 raise HTTPException(503, "GDP artifact changed during export")
+            total += item["size"]
             exported.append(name)
+        if skipped:
+            LOGGER.warning("GDP export for task %s skipped %s", session.seed.task_id.task_id, skipped)
         # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.
         with tempfile.NamedTemporaryFile(
             "w", dir=self.config.deliverables_root, suffix=".tmp", delete=False
         ) as marker:
-            json.dump({"paths": sorted(exported)}, marker)
+            json.dump({"paths": sorted(exported), "skipped": skipped}, marker)
         Path(marker.name).replace(target / "finish_params.json")
         session.deliverables = target
         return target

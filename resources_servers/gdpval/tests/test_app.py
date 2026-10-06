@@ -2299,7 +2299,7 @@ class Sandbox:
             for key, value in self.files.items()
             if key.startswith("/workspace/output/") and self.output_dir
         ]
-        listing = {"output_dir": self.output_dir, "entries": files}
+        listing = {"output_dir": self.output_dir, "entries": files, "unlisted": 0}
         return SimpleNamespace(return_code=0, stdout=json.dumps(listing), stderr="")
 
     async def upload_file(self, local, remote):
@@ -2738,7 +2738,8 @@ class LifecycleProvider:
         return handle
 
     async def exec(self, handle, command, **kwargs):
-        return SandboxExecResult(stdout=json.dumps({"output_dir": True, "entries": []}), stderr="", return_code=0)
+        listing = {"output_dir": True, "entries": [], "unlisted": 0}
+        return SandboxExecResult(stdout=json.dumps(listing), stderr="", return_code=0)
 
     async def close(self, handle):
         if self.close_errors:
@@ -2895,7 +2896,22 @@ def test_actual_export_listing_reports_unusable_output_directory(tmp_path, kind,
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     # A linked directory is never followed, and only an empty real one means the model saved nothing.
-    assert json.loads(result.stdout) == {"output_dir": usable, "entries": []}
+    assert json.loads(result.stdout) == {"output_dir": usable, "entries": [], "unlisted": 0}
+
+
+def test_actual_export_listing_stops_at_its_entry_limit(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    for name in ("c.csv", "a.csv", "b.csv"):
+        (output / name).write_text("x")
+    script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
+    script = script.replace(f"limit = {gdp_app._MAX_LISTED_ENTRIES}", "limit = 2")
+    assert "limit = 2" in script
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    listing = json.loads(result.stdout)
+    assert [entry["name"] for entry in listing["entries"]] == ["a.csv", "b.csv"]
+    assert listing["unlisted"] == 1
 
 
 def test_app_http_sandbox_lifecycle_uses_seeded_metadata(sandbox_server, monkeypatch):
@@ -2988,10 +3004,11 @@ async def test_unusable_output_directory_is_recorded_not_read_as_empty(sandbox_s
     assert task_attempted(str(target))
 
 
-def _listing(*entries):
+def _listing(*entries, unlisted=0):
     """Sandbox exec result for the output listing: (name, size, regular) tuples."""
     rows = [{"name": name, "size": size, "regular": regular} for name, size, regular in entries]
-    return SimpleNamespace(return_code=0, stdout=json.dumps({"output_dir": True, "entries": rows}), stderr="")
+    listing = {"output_dir": True, "entries": rows, "unlisted": unlisted}
+    return SimpleNamespace(return_code=0, stdout=json.dumps(listing), stderr="")
 
 
 async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, monkeypatch):
@@ -3037,12 +3054,15 @@ async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, mo
     for name, size in (("a.txt", 4), ("b.txt", 8), ("c.txt", 3), ("d.txt", 1)):
         box.files[f"/workspace/output/{name}"] = b"x" * size
     box.exec.side_effect = None
-    box.exec.return_value = _listing(("a.txt", 4, True), ("b.txt", 8, True), ("c.txt", 3, True), ("d.txt", 1, True))
+    box.exec.return_value = _listing(
+        ("a.txt", 4, True), ("b.txt", 8, True), ("c.txt", 3, True), ("d.txt", 1, True), unlisted=5
+    )
     target = await instance.export_deliverables("resources-1")
+    # The 5 entries past the listing limit are never exported, so they are counted with the skipped ones.
     assert json.loads((target / "finish_params.json").read_text()) == {
         "paths": ["a.txt", "c.txt"],
         "skipped": [{"name": "b.txt", "reason": "size limit"}, {"name": "d.txt", "reason": "file count limit"}],
-        "skipped_count": 2,
+        "skipped_count": 7,
     }
     assert sorted(p.name for p in target.iterdir()) == ["a.txt", "c.txt", "finish_params.json"]
 
@@ -3082,15 +3102,17 @@ async def test_file_changed_between_listing_and_copy_fails_the_export(sandbox_se
 @pytest.mark.parametrize(
     "listing",
     [
-        {"output_dir": True, "entries": [{"name": "a.txt", "size": 1}]},
-        {"output_dir": True, "entries": [{"name": "a.txt", "size": -1, "regular": True}]},
-        {"output_dir": True, "entries": [{"name": 3, "regular": True}]},
-        {"output_dir": True, "entries": None},
-        {"output_dir": "yes", "entries": []},
-        {"entries": []},
+        {"output_dir": True, "entries": [{"name": "a.txt", "size": 1}], "unlisted": 0},
+        {"output_dir": True, "entries": [{"name": "a.txt", "size": -1, "regular": True}], "unlisted": 0},
+        {"output_dir": True, "entries": [{"name": 3, "regular": True}], "unlisted": 0},
+        {"output_dir": True, "entries": None, "unlisted": 0},
+        {"output_dir": "yes", "entries": [], "unlisted": 0},
+        {"entries": [], "unlisted": 0},
+        {"output_dir": True, "entries": []},
+        {"output_dir": True, "entries": [], "unlisted": -1},
         [{"name": "a.txt", "size": 1, "regular": True}],
         # Entries from a directory the listing reports as unusable.
-        {"output_dir": False, "entries": [{"name": "a.txt", "size": 1, "regular": True}]},
+        {"output_dir": False, "entries": [{"name": "a.txt", "size": 1, "regular": True}], "unlisted": 0},
     ],
 )
 async def test_malformed_output_listing_is_an_export_failure(sandbox_server, listing):

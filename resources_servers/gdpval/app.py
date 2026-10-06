@@ -95,19 +95,23 @@ _MAX_SKIPPED_RECORDS = 100
 _MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
 _REFERENCE_DOWNLOAD_ATTEMPTS = 4
 _REFERENCE_RETRY_BASE_DELAY_S = 2.0
+# The model controls how many entries its output directory holds; the listing prints at most this many and counts
+# the rest as unlisted, so a huge directory cannot flood the export.
+_MAX_LISTED_ENTRIES = 10_000
 # Lists the top-level entries the export may copy. It reports a missing or symlinked output directory instead of
 # listing it, so that case is not mistaken for a model that saved nothing.
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
 usable = root.is_dir() and not root.is_symlink()
+paths = sorted(root.iterdir()) if usable else []
+limit = {_MAX_LISTED_ENTRIES}
 entries = []
-if usable:
-    for path in sorted(root.iterdir()):
-        info = path.lstat()
-        regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-        entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
-print(json.dumps({{'output_dir': usable, 'entries': entries}}))
+for path in paths[:limit]:
+    info = path.lstat()
+    regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
+print(json.dumps({{'output_dir': usable, 'entries': entries, 'unlisted': len(paths) - len(entries)}}))
 """
 
 
@@ -769,10 +773,13 @@ class GDPValResourcesServer(SimpleResourcesServer):
         listing = json.loads(result.stdout)
         output_dir = listing.get("output_dir") if isinstance(listing, dict) else None
         entries = listing.get("entries") if isinstance(listing, dict) else None
+        unlisted = listing.get("unlisted") if isinstance(listing, dict) else None
         # Nothing may be exported from a directory the listing itself reports as unusable.
         if (
             not isinstance(output_dir, bool)
             or not isinstance(entries, list)
+            or not isinstance(unlisted, int)
+            or unlisted < 0
             or (entries and not output_dir)
             or not all(
                 isinstance(item, dict)
@@ -801,12 +808,14 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise HTTPException(503, "GDP artifact changed during export")
             total += item["size"]
             exported.append(name)
-        record = {"paths": sorted(exported), "skipped": skipped[:_MAX_SKIPPED_RECORDS], "skipped_count": len(skipped)}
-        if skipped:
+        # Entries past the listing limit are never exported, so they count as skipped too.
+        skipped_count = len(skipped) + unlisted
+        record = {"paths": sorted(exported), "skipped": skipped[:_MAX_SKIPPED_RECORDS], "skipped_count": skipped_count}
+        if skipped_count:
             LOGGER.warning(
                 "GDP export for task %s skipped %d entries: %s",
                 session.seed.task_id.task_id,
-                len(skipped),
+                skipped_count,
                 record["skipped"],
             )
         # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.

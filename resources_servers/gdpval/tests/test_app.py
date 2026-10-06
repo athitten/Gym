@@ -12,27 +12,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import base64
 import json
+import subprocess
+import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import ClientPayloadError, ClientResponseError
+from fastapi import HTTPException
+from pydantic import ValidationError
 
+from nemo_gym.base_resources_server import ResourcesCloseSessionRequest, ResourcesSeedSessionRequest
+from nemo_gym.episode_types import EpisodeId, TaskId
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
+from nemo_gym.sandbox import AsyncSandbox
+from nemo_gym.sandbox.providers.base import SandboxExecResult, SandboxHandle
+from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
+from resources_servers.gdpval import app as gdp_app
 from resources_servers.gdpval.app import (
     GDPValResourcesServer,
     GDPValResourcesServerConfig,
     GDPValVerifyRequest,
+    GDPValVerifyResponse,
     _iter_ref_repeat_dirs,
     _strict_comparison_trial_failure,
 )
+from resources_servers.gdpval.comparison import task_attempted
+from resources_servers.gdpval.task_data import GDPFileTask, prepare_row
 
 
 def _server(reward_mode: str = "rubric", **extra) -> GDPValResourcesServer:
@@ -411,6 +427,106 @@ class TestApp:
             # Rubric mode tolerates missing libreoffice; the rubric path has its own
             # text-extraction fallback. Should not raise.
             _server(reward_mode="rubric", preconvert_office_to_pdf=True)
+
+    def test_configured_libreoffice_command_must_pass_its_check_in_any_mode(self) -> None:
+        with patch("resources_servers.gdpval.setup_libreoffice.ensure_libreoffice", return_value=False) as ensure:
+            # Unlike the host default, an explicit command that fails is a deployment error.
+            with pytest.raises(RuntimeError, match="libreoffice_command"):
+                _server(reward_mode="rubric", libreoffice_command=["/opt/lo-wrapper"])
+        ensure.assert_called_once_with(["/opt/lo-wrapper"])
+
+    def test_empty_libreoffice_command_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="libreoffice_command"):
+            _server(libreoffice_command=[])
+
+    @pytest.mark.asyncio
+    async def test_verify_comparison_preconverts_with_configured_command(self, tmp_path, monkeypatch) -> None:
+        import fitz
+
+        template = tmp_path / "render.pdf"
+        document = fitz.open()
+        document.new_page().insert_text((72, 72), "configured converter render")
+        document.save(template)
+        document.close()
+        converter = tmp_path / "bin" / "lo-wrapper"
+        converter.parent.mkdir()
+        # Like LibreOffice: the last two arguments are --outdir's value and the source.
+        converter.write_text(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\n"
+            '[ "$1" = "--version" ] && exit 0\n'
+            "while [ $# -gt 2 ]; do shift; done\n"
+            f'base=$(basename "$2"); cp "{template}" "$1/${{base%.*}}.pdf"\n'
+        )
+        converter.chmod(0o755)
+        eval_dir = tmp_path / "eval" / "task_task-1" / "repeat_0"
+        ref_root = tmp_path / "ref"
+        ref_dir = ref_root / "task_task-1" / "repeat_0"
+        for directory in (eval_dir, ref_dir):
+            directory.mkdir(parents=True)
+            (directory / "finish_params.json").write_text("{}")
+            (directory / "report.docx").write_bytes(b"office source")
+        empty = tmp_path / "empty-path"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))  # no host libreoffice can do the work
+        server = _server(
+            reward_mode="comparison",
+            reference_deliverables_dir=str(ref_root),
+            preconvert_office_to_pdf=True,
+            libreoffice_command=[str(converter)],
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value.choices = [MagicMock(message=MagicMock(content="BOXED[B]"))]
+        monkeypatch.setattr("resources_servers.gdpval.app.get_server_url", lambda _: "http://localhost:9999")
+        monkeypatch.setattr("openai.OpenAI", lambda **_: client)
+
+        response = await server.verify(_verify_request(deliverables_dir=str(eval_dir)))
+
+        assert response.judge_response["total_judged"] == 4
+        render = base64.b64encode(template.read_bytes()).decode()
+        for call in client.chat.completions.create.call_args_list:
+            # Both the eval and the reference report reach the judge as the rendered PDF.
+            assert json.dumps(call.kwargs["messages"]).count(render) == 2
+        assert (eval_dir / "report.pdf").is_file() and (ref_dir / "report.pdf").is_file()
+
+    @pytest.mark.asyncio
+    async def test_verify_rubric_renders_office_with_configured_command(self, tmp_path, monkeypatch) -> None:
+        from docx import Document
+
+        converter = tmp_path / "bin" / "lo-wrapper"
+        converter.parent.mkdir()
+        converter.write_text(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\n"
+            '[ "$1" = "--version" ] && exit 0\n'
+            "while [ $# -gt 2 ]; do shift; done\n"
+            'base=$(basename "$2"); printf "%%PDF-1.4 configured render" > "$1/${base%.*}.pdf"\n'
+        )
+        converter.chmod(0o755)
+        deliverables = tmp_path / "deliverables"
+        deliverables.mkdir()
+        document = Document()
+        document.add_paragraph("Quarterly throughput rose 12 percent.")
+        document.save(deliverables / "report.docx")
+        empty = tmp_path / "empty-path"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        with patch("resources_servers.gdpval.setup_libreoffice.ensure_libreoffice", return_value=True):
+            server = _server(reward_mode="rubric", libreoffice_command=[str(converter)])
+        captured: dict = {}
+
+        async def fake_visual(**kwargs):
+            captured.update(kwargs)
+            return 1.0, {"overall_score": 1.0}
+
+        body = _verify_request(rubric_json=[{"criterion": "clarity", "score": 1}], deliverables_dir=str(deliverables))
+        with (
+            patch("resources_servers.gdpval.scoring.score_with_rubric_visual", side_effect=fake_visual),
+            patch("resources_servers.gdpval.app.get_server_url", return_value="http://localhost:9999"),
+        ):
+            await server.verify(body)
+
+        blocks = json.dumps(captured["deliverable_content_blocks"])
+        assert base64.b64encode(b"%PDF-1.4 configured render").decode() in blocks
+        assert "text fallback" not in blocks
 
     def test_comparison_passes_when_libreoffice_available(self) -> None:
         with patch("resources_servers.gdpval.setup_libreoffice.ensure_libreoffice", return_value=True):
@@ -2125,3 +2241,754 @@ class TestComparisonPayloadHardening:
         )
         # ``timeout`` substring no longer triggers a blind retry.
         assert _is_retryable(RuntimeError("Request timed out")) is False
+
+
+def row(**extra):
+    return {
+        "task_id": "task-1",
+        "prompt": "Write a financial summary.",
+        "responses_create_params": {"input": []},
+        "reference_files": [],
+        "reference_file_urls": [],
+        "rubric_pretty": "PRIVATE RUBRIC",
+        **extra,
+    }
+
+
+def seed(**extra):
+    return ResourcesSeedSessionRequest(
+        resources_session_id="resources-1",
+        episode_id=EpisodeId(rollout_id="rollout-1"),
+        task_id=TaskId(taskset="gdp", task_id="task-1"),
+        task_data=row(),
+        **extra,
+    )
+
+
+def response():
+    return NeMoGymResponse(
+        id="response-1",
+        created_at=0,
+        model="model",
+        object="response",
+        output=[],
+        tools=[],
+        tool_choice="auto",
+        parallel_tool_calls=False,
+    )
+
+
+class Sandbox:
+    def __init__(self):
+        self.files = {"/workspace/output/report.csv": b"name,value\na,3\n"}
+        self.start = AsyncMock()
+        self.stop = AsyncMock()
+        self.serialize = AsyncMock(return_value={"sandbox_id": "task-box"})
+        self.exec = AsyncMock(side_effect=self.execute)
+        self.upload = AsyncMock(side_effect=self.upload_file)
+        self.download = AsyncMock(side_effect=self.download_file)
+
+    async def execute(self, command, **kwargs):
+        files = [
+            {"name": key.removeprefix("/workspace/output/"), "size": len(value), "regular": True}
+            for key, value in self.files.items()
+            if key.startswith("/workspace/output/")
+        ]
+        return SimpleNamespace(return_code=0, stdout=json.dumps(files), stderr="")
+
+    async def upload_file(self, local, remote):
+        self.files[remote] = Path(local).read_bytes()
+
+    async def download_file(self, remote, local):
+        Path(local).write_bytes(self.files[remote])
+
+
+@pytest.fixture
+def sandbox_server(tmp_path, monkeypatch):
+    box = Sandbox()
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", lambda provider: box)
+    monkeypatch.setattr(gdp_app, "get_global_config_dict", lambda: {})
+    monkeypatch.setattr(gdp_app, "resolve_provider_config", lambda *args: {"docker": {}})
+    config = GDPValResourcesServerConfig(
+        host="127.0.0.1",
+        port=8000,
+        name="resources",
+        entrypoint="app.py",
+        sandbox_provider="sandbox",
+        num_workers=1,
+        image="test-only",
+        deliverables_root=tmp_path,
+        preconvert_office_to_pdf=False,
+        judge_model_server={"type": "responses_api_models", "name": "judge"},
+    )
+    instance = GDPValResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    return instance, box, SimpleNamespace(session={})
+
+
+def test_prepare_only_exposes_prompt_and_reference_paths():
+    source = row(reference_files='["a.xlsx"]', reference_file_urls='["https://example.com/a.xlsx"]')
+    prepared = prepare_row(source)
+    text = prepared["responses_create_params"]["input"][0]["content"]
+    assert "PRIVATE RUBRIC" not in text
+    assert "https://example.com" not in text
+    assert "/workspace/input/a.xlsx" in text
+    assert "/workspace/output" in text
+    assert "finish tool" not in text
+    assert prepared["rubric_pretty"] == "PRIVATE RUBRIC"
+    assert prepared["reference_files"] == ["a.xlsx"]
+    assert prepared["reference_file_urls"] == ["https://example.com/a.xlsx"]
+    assert source["responses_create_params"]["input"] == []
+
+
+@pytest.mark.parametrize("name", ["../secret", "/etc/passwd", "a/../../x", "a\\b", "a//b", ".", "a/./b", "a\x00b"])
+def test_unsafe_reference_paths_rejected(name):
+    with pytest.raises(ValueError):
+        GDPFileTask.model_validate(row(reference_files=[name], reference_file_urls=["https://example.com/file"]))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"reference_files": ["x"], "reference_file_urls": []},
+        {"reference_files": ["x", "x"], "reference_file_urls": ["https://example.com/x"] * 2},
+        {"reference_files": ["x"], "reference_file_urls": ["file:///secret"]},
+    ],
+)
+def test_bad_reference_metadata_rejected(fields):
+    with pytest.raises(ValueError):
+        GDPFileTask.model_validate(row(**fields))
+
+
+async def test_seed_is_idempotent_and_lends_resources_owned_sandbox(sandbox_server):
+    instance, box, request = sandbox_server
+    first, second = await asyncio.gather(
+        instance.seed_session(request, seed()), instance.seed_session(request, seed())
+    )
+    assert first == second
+    assert first.sandbox_access.workdir == "/workspace"
+    assert first.sandbox_access.connection.descriptor == {"sandbox_id": "task-box"}
+    assert request.session[SESSION_ID_KEY] == "resources-1"
+    box.start.assert_awaited_once()
+    box.stop.assert_not_awaited()
+    spec = box.start.call_args.args[0]
+    assert "PRIVATE RUBRIC" not in str(spec)
+
+
+async def test_seed_conflict_rejected(sandbox_server):
+    instance, _, request = sandbox_server
+    body = seed()
+    await instance.seed_session(request, body)
+    body.task_data["prompt"] = "Different task"
+    with pytest.raises(HTTPException, match="bound"):
+        await instance.seed_session(request, body)
+
+
+async def test_reference_bytes_staged_before_sandbox_is_exposed(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    content = b"PK\x00\xffbinary spreadsheet\n"
+
+    async def chunks(*args):
+        yield content
+
+    download = SimpleNamespace(
+        raise_for_status=MagicMock(),
+        release=MagicMock(),
+        content=SimpleNamespace(iter_chunked=chunks),
+    )
+    monkeypatch.setattr(gdp_app, "http_request", AsyncMock(return_value=download))
+    body = seed()
+    body.task_data.update(reference_files=["nested/a.xlsx"], reference_file_urls=["https://example.com/a"])
+    await instance.seed_session(request, body)
+    assert box.files["/workspace/input/nested/a.xlsx"] == content
+    download.release.assert_called_once()
+
+
+async def test_reference_failure_stops_sandbox_and_never_exposes_access(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    monkeypatch.setattr(instance, "_stage_references", AsyncMock(side_effect=RuntimeError("download failed")))
+    with pytest.raises(RuntimeError, match="download failed"):
+        await instance.seed_session(request, seed())
+    box.stop.assert_awaited_once()
+    box.serialize.assert_not_awaited()
+    assert SESSION_ID_KEY not in request.session
+
+
+def _reference_download(*results):
+    """Fake http_request: each result is response bytes, an HTTP status to raise, or (partial bytes, error)."""
+
+    def respond(result):
+        async def chunks(*args):
+            if isinstance(result, tuple):
+                yield result[0]
+                raise result[1]
+            yield result
+
+        failure = None
+        if isinstance(result, int):
+            failure = ClientResponseError(MagicMock(), (), status=result, message="upstream error")
+        return SimpleNamespace(
+            raise_for_status=MagicMock(side_effect=failure),
+            release=MagicMock(),
+            content=SimpleNamespace(iter_chunked=chunks),
+        )
+
+    return AsyncMock(side_effect=[respond(result) for result in results])
+
+
+def _seed_with_reference():
+    body = seed()
+    body.task_data.update(reference_files=["a.xlsx"], reference_file_urls=["https://example.com/a.xlsx"])
+    return body
+
+
+def test_reference_cap_fits_largest_gdpval_reference():
+    # TWT_A001_03.mp4 for task a941b6d8 is 689,061,330 bytes; a smaller cap makes that task unrunnable.
+    assert gdp_app._MAX_REFERENCE_BYTES > 689_061_330
+
+
+async def test_reference_over_size_limit_fails_terminally(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    monkeypatch.setattr(gdp_app, "_MAX_REFERENCE_BYTES", 4)
+    download = _reference_download(b"12345")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    # A 4xx other than 408/425/429 is terminal for the Environment Server, so the episode is not re-run.
+    assert raised.value.status_code == 413
+    assert download.await_count == 1
+    box.stop.assert_awaited_once()
+    box.serialize.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_reference_download_retries_transient_errors(sandbox_server, monkeypatch, status):
+    instance, box, request = sandbox_server
+    download = _reference_download(status, b"reference")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    await instance.seed_session(request, _seed_with_reference())
+    assert box.files["/workspace/input/a.xlsx"] == b"reference"
+    assert download.await_count == 2
+    # The download loop owns retries; request() itself makes one try per attempt.
+    assert all(call.kwargs["_max_connection_retries"] == 1 for call in download.await_args_list)
+
+
+async def test_reference_download_does_not_retry_missing_files(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(404)
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    assert raised.value.status_code == 424  # Terminal for the Environment Server.
+    assert download.await_count == 1
+    box.stop.assert_awaited_once()
+
+
+async def test_reference_download_gives_up_with_retryable_status(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(503, 503, 503, 503)
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    assert raised.value.status_code == 503  # Retryable: a later episode attempt may succeed.
+    assert download.await_count == gdp_app._REFERENCE_DOWNLOAD_ATTEMPTS
+    box.serialize.assert_not_awaited()
+
+
+async def test_interrupted_reference_download_is_rewritten(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    download = _reference_download(b"first", (b"sec", ClientPayloadError("connection lost")), b"second")
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    body = seed()
+    body.task_data.update(
+        reference_files=["a.xlsx", "b.xlsx"],
+        reference_file_urls=["https://example.com/a.xlsx", "https://example.com/b.xlsx"],
+    )
+    await instance.seed_session(request, body)
+    assert box.files["/workspace/input/a.xlsx"] == b"first"
+    assert box.files["/workspace/input/b.xlsx"] == b"second"
+
+
+async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    captured = []
+
+    async def grade(self, body):
+        captured.append(body)
+        assert Path(body.deliverables_dir, "report.csv").read_bytes() == b"name,value\na,3\n"
+        assert body.rubric_pretty == "PRIVATE RUBRIC"
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.75)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    body = GDPValVerifyRequest(
+        **row(rubric_pretty="TAMPERED"), response=response(), deliverables_dir="/untrusted/path"
+    )
+    first = await instance.verify(body, request=request)
+    second = await instance.verify(body, request=request)
+    assert first.reward == second.reward == 0.75
+    assert len(captured) == 1
+    box.stop.assert_not_awaited()
+    close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+    assert await instance.close_resources_session(request, close) == await instance.close_resources_session(
+        request, close
+    )
+    box.stop.assert_awaited_once()
+    assert Path(first.deliverables_dir, "report.csv").exists()
+    with pytest.raises(HTTPException, match="closed"):
+        await instance.seed_session(request, seed())
+
+
+async def test_invalid_judge_verdict_keeps_export_for_rejudging(sandbox_server, monkeypatch):
+    from nemo_gym.config_types import AggregateMetricsRequest
+
+    instance, _, request = sandbox_server
+    await instance.seed_session(request, seed())
+    calls = []
+
+    async def invalid(self, body):
+        calls.append(body.deliverables_dir)
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.0, invalid_judge_response=True)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", invalid)
+    verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    # The row reaches the rollout file with its export, so judge-only scoring can re-judge it.
+    assert verdict.invalid_judge_response is True
+    assert task_attempted(verdict.deliverables_dir)
+    assert Path(verdict.deliverables_dir, "report.csv").exists()
+    # A repeated verify returns the same verdict rather than judging again.
+    assert await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request) == verdict
+    assert len(calls) == 1
+    aggregate = await instance.aggregate_metrics(AggregateMetricsRequest(verify_responses=[verdict.model_dump()]))
+    assert aggregate.agent_metrics["rubric/legacy_invalid_rows_excluded"] == 1
+    assert aggregate.agent_metrics["rubric/aggregate_rows_included"] == 0
+
+
+async def test_failed_close_retains_handle_for_retry(sandbox_server):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.stop.side_effect = [RuntimeError("provider unavailable"), None]
+    close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+    with pytest.raises(RuntimeError):
+        await instance.close_resources_session(request, close)
+    assert "resources-1" in instance._sessions
+    await instance.close_resources_session(request, close)
+    assert "resources-1" not in instance._sessions
+    assert box.stop.await_count == 2
+
+
+async def test_close_before_seed_fences_delayed_seed(sandbox_server):
+    instance, box, request = sandbox_server
+    close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+    await instance.close_resources_session(request, close)
+    with pytest.raises(HTTPException):
+        await instance.seed_session(request, seed())
+    box.start.assert_not_awaited()
+
+
+async def test_export_failure_prevents_grading(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.exec.side_effect = None
+    box.exec.return_value = SimpleNamespace(return_code=1, stderr="symlink rejected")
+    grader = AsyncMock()
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grader)
+    with pytest.raises(HTTPException) as error:
+        await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    assert error.value.status_code == 503
+    grader.assert_not_awaited()
+
+
+async def test_other_session_cannot_verify_or_close(sandbox_server):
+    instance, _, request = sandbox_server
+    await instance.seed_session(request, seed())
+    with pytest.raises(HTTPException):
+        await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=SimpleNamespace(session={}))
+    with pytest.raises(HTTPException):
+        await instance.close_resources_session(
+            request,
+            ResourcesCloseSessionRequest(
+                resources_session_id="resources-1",
+                episode_id=EpisodeId(rollout_id="other"),
+            ),
+        )
+
+
+class LifecycleProvider:
+    """Provider fake; the real AsyncSandbox enforces start/stop state."""
+
+    name = "lifecycle"
+
+    def __init__(self, boxes, close_errors):
+        self.boxes, self.close_errors = boxes, close_errors
+
+    async def create(self, spec):
+        handle = SandboxHandle(sandbox_id=f"box-{len(self.boxes)}", provider_name=self.name, raw=None)
+        self.boxes[handle.sandbox_id] = "live"
+        return handle
+
+    async def exec(self, handle, command, **kwargs):
+        return SandboxExecResult(stdout="[]", stderr="", return_code=0)
+
+    async def close(self, handle):
+        if self.close_errors:
+            raise self.close_errors.pop(0)
+        self.boxes[handle.sandbox_id] = "closed"
+
+    async def aclose(self):
+        pass
+
+    async def serialize_handle(self, handle, *, scope=None):
+        return {"sandbox_id": handle.sandbox_id}
+
+    async def connect(self, descriptor):
+        raise NotImplementedError
+
+
+@pytest.fixture
+def lifecycle_server(sandbox_server, monkeypatch):
+    instance, _, request = sandbox_server
+    boxes, close_errors = {}, []
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", lambda provider: AsyncSandbox(LifecycleProvider(boxes, close_errors)))
+    staging = AsyncMock(side_effect=[RuntimeError("download failed"), None])
+    monkeypatch.setattr(instance, "_stage_references", staging)
+    return instance, boxes, close_errors, request
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_same_session_seed_retry_replaces_failed_sandbox(lifecycle_server, cleanup_fails):
+    instance, boxes, close_errors, request = lifecycle_server
+    if cleanup_fails:
+        close_errors.append(RuntimeError("provider unavailable"))
+    with pytest.raises(RuntimeError, match="download failed"):
+        await instance.seed_session(request, seed())
+    seeded = await instance.seed_session(request, seed())
+    assert seeded.sandbox_access.connection.descriptor["sandbox_id"] == "box-1"
+    assert boxes == {"box-0": "closed", "box-1": "live"}
+
+
+async def test_seed_retry_waiting_on_failed_attempt_gets_fresh_sandbox(lifecycle_server, monkeypatch):
+    instance, boxes, _, request = lifecycle_server
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stage(sandbox, task):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+            raise RuntimeError("download failed")
+
+    monkeypatch.setattr(instance, "_stage_references", stage)
+    first = asyncio.create_task(instance.seed_session(request, seed()))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    second = asyncio.create_task(instance.seed_session(request, seed()))
+    await asyncio.sleep(0)  # The resent request now waits on the session lock.
+    release.set()
+    with pytest.raises(RuntimeError, match="download failed"):
+        await asyncio.wait_for(first, timeout=5)
+    seeded = await asyncio.wait_for(second, timeout=5)
+    assert seeded.sandbox_access.connection.descriptor["sandbox_id"] == "box-1"
+    assert boxes == {"box-0": "closed", "box-1": "live"}
+
+
+async def test_seed_retry_never_replaces_unstopped_sandbox(lifecycle_server):
+    instance, boxes, close_errors, request = lifecycle_server
+    close_errors.extend([RuntimeError("provider unavailable")] * 10)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            await instance.seed_session(request, seed())
+    assert boxes == {"box-0": "live"}
+    close_errors.clear()
+    close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+    await instance.close_resources_session(request, close)
+    assert boxes == {"box-0": "closed"}
+
+
+def test_app_http_json_string_reference_lists_verify(sandbox_server, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    instance, box, _ = sandbox_server
+
+    async def chunks(*args):
+        yield b"reference"
+
+    download = SimpleNamespace(
+        raise_for_status=MagicMock(), release=MagicMock(), content=SimpleNamespace(iter_chunked=chunks)
+    )
+    monkeypatch.setattr(gdp_app, "http_request", AsyncMock(return_value=download))
+    graded = []
+
+    async def grade(self, body):
+        graded.append(body)
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.75)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    body = seed()
+    body.task_data.update(reference_files='["a.xlsx"]', reference_file_urls='["https://example.com/a.xlsx"]')
+    with TestClient(instance.setup_webserver()) as client:
+        assert client.post("/seed_session", json=body.model_dump(mode="json")).status_code == 200
+        # single_agent_turn sends task_data | {responses_create_params, response} to /verify.
+        verify = body.task_data | {
+            "responses_create_params": {"input": []},
+            "response": response().model_dump(mode="json"),
+        }
+        result = client.post("/verify", json=verify)
+        assert result.status_code == 200, result.text
+    assert box.files["/workspace/input/a.xlsx"] == b"reference"
+    assert graded[0].reference_file_urls == ["https://example.com/a.xlsx"]
+
+
+def test_config_rejects_relative_output_and_multiple_workers(sandbox_server):
+    instance, _, _ = sandbox_server
+    for change in ({"deliverables_root": "relative"}, {"num_workers": 2}):
+        with pytest.raises(ValidationError):
+            GDPValResourcesServerConfig.model_validate(instance.config.model_dump() | change)
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink", "directory", "hardlink"])
+def test_actual_export_listing_flags_nonregular_deliverables(tmp_path, kind):
+    output = tmp_path / "output"
+    output.mkdir()
+    candidate = output / "report.csv"
+    outside = tmp_path / "not-a-deliverable"
+    outside.write_bytes(b"private data")
+    if kind == "file":
+        candidate.write_bytes(b"a,b\n1,2\n")
+    elif kind == "symlink":
+        candidate.symlink_to(outside)
+    elif kind == "directory":
+        candidate.mkdir()
+    else:
+        candidate.hardlink_to(outside)
+    script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    [entry] = json.loads(result.stdout)
+    assert entry["name"] == "report.csv"
+    assert entry["regular"] is (kind == "file")
+    if kind == "file":
+        assert entry["size"] == 8
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink"])
+def test_actual_export_listing_ignores_unusable_output_directory(tmp_path, kind):
+    output = tmp_path / "output"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.csv").write_bytes(b"secret")
+    if kind == "symlink":
+        output.symlink_to(outside)
+    script = gdp_app._LIST_OUTPUTS.replace(repr("/workspace/output"), repr(str(output)))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
+
+
+def test_app_http_sandbox_lifecycle_uses_seeded_metadata(sandbox_server, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    instance, box, _ = sandbox_server
+    graded = []
+
+    async def grade(self, body):
+        graded.append(body)
+        assert body.rubric_pretty == "PRIVATE RUBRIC"
+        assert Path(body.deliverables_dir, "report.csv").read_bytes() == box.files["/workspace/output/report.csv"]
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.75)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    with TestClient(instance.setup_webserver()) as client:
+        seeded = client.post("/seed_session", json=seed().model_dump(mode="json"))
+        assert seeded.status_code == 200, seeded.text
+        assert seeded.json()["sandbox_access"]["connection"]["descriptor"] == {"sandbox_id": "task-box"}
+        body = GDPValVerifyRequest(**row(rubric_pretty="TAMPERED"), response=response())
+        result = client.post("/verify", json=body.model_dump(mode="json"))
+        assert result.status_code == 200, result.text
+        assert result.json()["reward"] == 0.75
+        close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+        closed = client.post("/close_session", json=close.model_dump(mode="json"))
+        assert closed.status_code == 200, closed.text
+        assert not instance._sessions
+    assert len(graded) == 1
+    box.stop.assert_awaited_once()
+
+
+def test_app_http_stateless_lifecycle_preserves_existing_judging(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    instance = _server(num_workers=2)
+    box = MagicMock(side_effect=AssertionError("Stateless judging must not create a sandbox"))
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", box)
+    with TestClient(instance.setup_webserver()) as client:
+        assert client.post("/seed_session", json={}).json() == {}
+        seeded = client.post("/seed_session", json=seed().model_dump(mode="json"))
+        assert seeded.status_code == 200, seeded.text
+        assert seeded.json()["resources_session_id"] == "resources-1"
+        assert seeded.json()["sandbox_access"] is None
+        result = client.post("/verify", json=_verify_request().model_dump(mode="json"))
+        assert result.status_code == 200, result.text
+        assert result.json()["judge_response"] == {"scoring_error": "missing_rubric"}
+        close = ResourcesCloseSessionRequest(resources_session_id="resources-1", episode_id=seed().episode_id)
+        assert client.post("/close_session", json=close.model_dump(mode="json")).status_code == 200
+    box.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["image", "deliverables_root"])
+def test_sandbox_config_requires_complete_runtime_settings(sandbox_server, missing):
+    instance, _, _ = sandbox_server
+    with pytest.raises(ValidationError, match="Sandbox sessions require"):
+        GDPValResourcesServerConfig.model_validate(instance.config.model_dump() | {missing: None})
+
+
+async def test_export_writes_completion_marker_and_skips_run_state_files(sandbox_server):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.files["/workspace/output/finish_params.json"] = b"not a marker"
+    box.files["/workspace/output/history.json"] = b"{}"
+    target = await instance.export_deliverables("resources-1")
+    assert sorted(p.name for p in target.iterdir()) == ["finish_params.json", "report.csv"]
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": ["report.csv"],
+        "skipped": [
+            {"name": "finish_params.json", "reason": "reserved run-state name"},
+            {"name": "history.json", "reason": "reserved run-state name"},
+        ],
+    }
+    assert task_attempted(str(target))
+    assert not list(instance.config.deliverables_root.glob("*.tmp"))
+
+
+def _listing(*entries):
+    """Sandbox exec result for the output listing: (name, size, regular) tuples."""
+    rows = [{"name": name, "size": size, "regular": regular} for name, size, regular in entries]
+    return SimpleNamespace(return_code=0, stdout=json.dumps(rows), stderr="")
+
+
+async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.files["/workspace/output/a\\b.txt"] = b"x"
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(
+        ("a\\b.txt", 1, True), ("charts", 4096, False), ("link.csv", 9, False), ("report.csv", 15, True)
+    )
+    graded = []
+
+    async def grade(self, body):
+        graded.append(sorted(p.name for p in Path(body.deliverables_dir).iterdir()))
+        return GDPValVerifyResponse(**body.model_dump(), reward=0.5)
+
+    monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)
+    verdict = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    assert verdict.reward == 0.5
+    assert graded == [["finish_params.json", "report.csv"]]
+    marker = json.loads((instance._sessions["resources-1"].deliverables / "finish_params.json").read_text())
+    assert marker == {
+        "paths": ["report.csv"],
+        "skipped": [
+            {"name": "a\\b.txt", "reason": "unsupported file name"},
+            {"name": "charts", "reason": "not a regular file"},
+            {"name": "link.csv", "reason": "not a regular file"},
+        ],
+    }
+
+
+async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    monkeypatch.setattr(gdp_app, "_MAX_EXPORT_FILES", 2)
+    monkeypatch.setattr(gdp_app, "_MAX_EXPORT_BYTES", 10)
+    for name, size in (("a.txt", 4), ("b.txt", 8), ("c.txt", 3), ("d.txt", 1)):
+        box.files[f"/workspace/output/{name}"] = b"x" * size
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(("a.txt", 4, True), ("b.txt", 8, True), ("c.txt", 3, True), ("d.txt", 1, True))
+    target = await instance.export_deliverables("resources-1")
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": ["a.txt", "c.txt"],
+        "skipped": [{"name": "b.txt", "reason": "size limit"}, {"name": "d.txt", "reason": "file count limit"}],
+    }
+    assert sorted(p.name for p in target.iterdir()) == ["a.txt", "c.txt", "finish_params.json"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{"name": "a.txt", "size": 1}, {"name": "a.txt", "size": -1, "regular": True}, {"name": 3, "regular": True}],
+)
+async def test_malformed_output_listing_is_an_export_failure(sandbox_server, entry):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    box.exec.side_effect = None
+    box.exec.return_value = SimpleNamespace(return_code=0, stdout=json.dumps([entry]), stderr="")
+    with pytest.raises(HTTPException) as error:
+        await instance.export_deliverables("resources-1")
+    assert error.value.status_code == 503
+
+
+def _reference_models(root):
+    references = {}
+    for ref_id, elo in (("ref_a", 1100.0), ("ref_b", 1300.0)):
+        repeat = root / ref_id / "task_task-1" / "repeat_0"
+        repeat.mkdir(parents=True)
+        (repeat / "finish_params.json").write_text("{}")
+        (repeat / "answer.csv").write_text("x,1\n")
+        references[ref_id] = {"deliverables_dir": str(root / ref_id), "elo": elo}
+    return references
+
+
+@pytest.fixture
+def comparison_sandbox_server(tmp_path, monkeypatch):
+    box = Sandbox()
+    monkeypatch.setattr(gdp_app, "AsyncSandbox", lambda provider: box)
+    monkeypatch.setattr(gdp_app, "get_global_config_dict", lambda: {})
+    monkeypatch.setattr(gdp_app, "resolve_provider_config", lambda *args: {"docker": {}})
+    config = GDPValResourcesServerConfig(
+        host="127.0.0.1",
+        port=8000,
+        name="resources",
+        entrypoint="app.py",
+        sandbox_provider="sandbox",
+        num_workers=1,
+        image="test-only",
+        deliverables_root=tmp_path / "exports",
+        preconvert_office_to_pdf=False,
+        reward_mode="comparison",
+        reference_models=_reference_models(tmp_path / "refs"),
+        num_comparison_trials=4,
+        judge_model_server={"type": "responses_api_models", "name": "judge"},
+    )
+    instance = GDPValResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    return instance, SimpleNamespace(session={})
+
+
+async def test_sandbox_comparison_judges_exported_files_against_assigned_reference(comparison_sandbox_server):
+    # Multistage ELO stamps reference_ids and stage_index on each row; single_agent_turn_legacy forwards them as task_data.
+    instance, request = comparison_sandbox_server
+    body = ResourcesSeedSessionRequest(
+        resources_session_id="resources-1",
+        episode_id=EpisodeId(rollout_id="rollout-1"),
+        task_id=TaskId(taskset="gdp", task_id="task-1"),
+        task_data=row(reference_ids=["ref_b"], stage_index=0),
+    )
+    await instance.seed_session(request, body)
+    judged = {
+        "winner": "[[B]]",
+        "win_count_a": 0,
+        "win_count_b": 4,
+        "tie_count": 0,
+        "task_count": 4,
+        "invalid_count": 0,
+    }
+    run_trials = MagicMock(return_value=judged)
+    with (
+        patch("resources_servers.gdpval.comparison.run_trials", new=run_trials),
+        patch("resources_servers.gdpval.app.get_server_url", return_value="http://localhost:9999"),
+        patch("resources_servers.gdpval.comparison.build_file_section", return_value=[]),
+        patch("openai.OpenAI", return_value=MagicMock()),
+    ):
+        result = await instance.verify(GDPValVerifyRequest(**row(), response=response()), request=request)
+    # Without the export marker every row came back as eval_missing and no judge call was made.
+    assert result.model_dump().get(NG_FAILURE_CLASS_KEY) is None
+    assert set(result.per_reference) == {"ref_b"}
+    assert result.total_wins == 4
+    run_trials.assert_called_once()

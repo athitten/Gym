@@ -14,7 +14,7 @@
 # limitations under the License.
 """GDPVal resources server.
 
-Scores Stirrup agent deliverables for the GDPVal benchmark. Two modes,
+Scores agent deliverables for the GDPVal benchmark. Two modes,
 selected via ``reward_mode`` config:
 
 - ``rubric``: score deliverables against a per-task rubric using an LLM
@@ -37,21 +37,42 @@ unset — there is one panel-based code path either way.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+import tempfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from shlex import quote
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, ClientTimeout
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from typing_extensions import Self
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
+    BaseSeedSessionRequest,
+    BaseSeedSessionResponse,
     BaseVerifyRequest,
     BaseVerifyResponse,
+    ResourcesCloseSessionRequest,
+    ResourcesCloseSessionResponse,
+    ResourcesSeedSessionRequest,
+    ResourcesSeedSessionResponse,
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef
+from nemo_gym.deliverables import IGNORE_FILES
+from nemo_gym.episode_types import EpisodeId
+from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_TERMINAL_KEY
-from nemo_gym.server_utils import get_server_url
+from nemo_gym.sandbox import AsyncSandbox, SandboxSpec, resolve_provider_config
+from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
+from nemo_gym.server_utils import SESSION_ID_KEY, get_server_url
+from nemo_gym.server_utils import request as http_request
 from resources_servers.gdpval.judge_panel import (
     ResolvedJudge,
     dir_media_modalities,
@@ -59,9 +80,52 @@ from resources_servers.gdpval.judge_panel import (
     panel_summary,
 )
 from resources_servers.gdpval.scoring import SCORING_ERROR_KEY
+from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, json_list, relative_file
 
 
 LOGGER = logging.getLogger(__name__)
+# Per attempt. Two GDPVal gold deliverables exceed 128 MiB (a 171 MiB zip and a 278 MiB video).
+_MAX_EXPORT_BYTES = 1024 * 1024 * 1024
+_MAX_EXPORT_FILES = 100
+# Per reference file. The largest GDPVal reference is about 660 MiB (task a941b6d8).
+_MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
+_REFERENCE_DOWNLOAD_ATTEMPTS = 4
+_REFERENCE_RETRY_BASE_DELAY_S = 2.0
+# Lists the top-level entries the export may copy; a missing or symlinked output directory lists nothing.
+_LIST_OUTPUTS = f"""
+import json, pathlib, stat
+root = pathlib.Path({OUTPUT_DIR!r})
+entries = []
+if root.is_dir() and not root.is_symlink():
+    for path in sorted(root.iterdir()):
+        info = path.lstat()
+        regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
+print(json.dumps(entries))
+"""
+
+
+def _export_skip_reason(item: Dict[str, Any], exported: int, total: int) -> Optional[str]:
+    """Why a listed output entry is not exported, or None when it is.
+
+    The model owns the output layout, so an entry the judge cannot read is skipped and recorded rather than
+    failed as an infrastructure error. Judges read only top-level regular files.
+    """
+    if item["name"] in IGNORE_FILES:
+        return "reserved run-state name"
+    if item["regular"] is not True:
+        return "not a regular file"
+    try:
+        plain = "/" not in relative_file(item["name"])
+    except ValueError:
+        plain = False
+    if not plain:
+        return "unsupported file name"
+    if exported >= _MAX_EXPORT_FILES:
+        return "file count limit"
+    if total + item["size"] > _MAX_EXPORT_BYTES:
+        return "size limit"
+    return None
 
 
 def _is_invalid_judge_result(judge_result: Any) -> bool:
@@ -244,6 +308,28 @@ def _strict_comparison_trial_failure(
 
 
 class GDPValResourcesServerConfig(BaseResourcesServerConfig):
+    # Set a provider to let this resources server own file-task sandboxes.
+    # With no provider, existing Stirrup/judge-only requests stay stateless.
+    sandbox_provider: Optional[str] = None
+    image: Optional[str] = Field(default=None, min_length=1)
+    deliverables_root: Optional[Path] = None
+
+    @field_validator("deliverables_root")
+    @classmethod
+    def absolute_output(cls, value: Optional[Path]) -> Optional[Path]:
+        if value is not None and not value.is_absolute():
+            raise ValueError("deliverables_root must be absolute")
+        return value
+
+    @model_validator(mode="after")
+    def validate_sandbox_config(self) -> Self:
+        if self.sandbox_provider is not None:
+            if not self.sandbox_provider or self.image is None or self.deliverables_root is None:
+                raise ValueError("Sandbox sessions require sandbox_provider, image, and deliverables_root")
+            if self.num_workers not in (None, 1):
+                raise ValueError("GDPVal process-local sessions require num_workers=1")
+        return self
+
     reward_mode: Literal["rubric", "comparison"] = "rubric"
 
     # Comparison-mode: one or more reference models the eval deliverable is
@@ -289,6 +375,14 @@ class GDPValResourcesServerConfig(BaseResourcesServerConfig):
     # read tables/charts. Costs ~5-30s per Office file.
     preconvert_office_to_pdf: bool = True
     preconvert_max_concurrent: int = 4
+    # Command that runs LibreOffice for every Office->PDF conversion (comparison
+    # preconvert and rubric rendering), e.g. a container prefix
+    # [apptainer, exec, --bind, /lustre, --bind, /tmp, /path/gdpval.sif, libreoffice]
+    # or a wrapper script. It must see the deliverable, reference and temp
+    # directories at the same absolute paths. When set, startup checks it with
+    # --version and a probe conversion and fails if the check fails; the host
+    # javaldx check and apt install are skipped. None uses `libreoffice` on PATH.
+    libreoffice_command: Optional[List[str]] = Field(default=None, min_length=1)
 
     # How deliverable/reference files are presented to the judge:
     # - ``"native_pdf"`` (default): PDFs and (preconverted) Office docs are sent
@@ -407,6 +501,12 @@ class GDPValVerifyRequest(BaseVerifyRequest):
     ng_rollout_index: Optional[int] = Field(default=None, alias="_ng_rollout_index")
     ng_attempt_index: Optional[int] = Field(default=None, alias="_ng_attempt_index")
 
+    @field_validator("reference_file_urls", mode="before")
+    @classmethod
+    def parse_reference_file_urls(cls, value: object) -> object:
+        # Accept the JSON-encoded list that GDPFileTask accepts at seed time.
+        return json_list(value)
+
 
 # The reference model has no deliverable for this task, so no battle can be
 # scored. An infrastructure gap, not a model outcome. Kept here rather than in
@@ -450,9 +550,23 @@ class GDPValVerifyResponse(GDPValVerifyRequest, BaseVerifyResponse):
     per_reference: Optional[Dict[str, Dict[str, Any]]] = None
 
 
+@dataclass
+class _Session:
+    seed: ResourcesSeedSessionRequest
+    sandbox: AsyncSandbox
+    ready: bool = False
+    # A failed seed stopped (or failed to stop) this sandbox; AsyncSandbox cannot start again after stop().
+    failed: bool = False
+    deliverables: Path | None = None
+    verdict: GDPValVerifyResponse | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class GDPValResourcesServer(SimpleResourcesServer):
     ray_enabled = False
     config: GDPValResourcesServerConfig
+    _sessions: dict[str, _Session] = PrivateAttr(default_factory=dict)
+    _closed: dict[str, EpisodeId] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, context: Any) -> None:
         self._judge_prompt_fpath: str = self.config.judge_prompt_template_fpath or _DEFAULT_JUDGE_PROMPT_FPATH
@@ -474,7 +588,16 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise ValueError(
                     "reward_mode=comparison requires reference_deliverables_dir or reference_models to be set"
                 )
-        if self.config.preconvert_office_to_pdf:
+        if self.config.libreoffice_command is not None:
+            from resources_servers.gdpval.setup_libreoffice import ensure_libreoffice
+
+            if not ensure_libreoffice(self.config.libreoffice_command):
+                raise RuntimeError(
+                    f"libreoffice_command {self.config.libreoffice_command} failed its startup check "
+                    "(--version and a probe conversion; see the warning above). The command must see "
+                    "the deliverables, reference and temp directories at the same paths."
+                )
+        elif self.config.preconvert_office_to_pdf:
             from resources_servers.gdpval.setup_libreoffice import ensure_libreoffice
 
             if not ensure_libreoffice() and self.config.reward_mode == "comparison":
@@ -485,6 +608,224 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     "deployment container, or set preconvert_office_to_pdf=false to opt out."
                 )
         super().model_post_init(context)
+
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        parent = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            try:
+                async with parent(app) as state:
+                    yield state
+            finally:
+                for session in list(self._sessions.values()):
+                    try:
+                        async with asyncio.timeout(60):
+                            await session.sandbox.stop()
+                    except Exception:
+                        LOGGER.exception("Failed to stop GDP sandbox during shutdown")
+
+        app.router.lifespan_context = lifespan
+        return app
+
+    async def seed_session(
+        self, request: Request, body: ResourcesSeedSessionRequest | BaseSeedSessionRequest
+    ) -> ResourcesSeedSessionResponse | BaseSeedSessionResponse:
+        """Prepare and lend a task sandbox when configured; otherwise use stateless seeding."""
+        if self.config.sandbox_provider is None:
+            return await super().seed_session(body)
+        if not isinstance(body, ResourcesSeedSessionRequest):
+            raise HTTPException(422, "GDP sandbox sessions require an Environment Server task")
+        session_id = body.resources_session_id
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", session_id):
+            raise HTTPException(422, "Invalid resources_session_id")
+        task = GDPFileTask.model_validate(body.task_data)
+        if task.task_id != body.task_id.task_id:
+            raise HTTPException(422, "Task ID does not match task_data")
+        if session_id in self._closed:
+            raise HTTPException(409, "Resources session is already closed")
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = _Session(body.model_copy(deep=True), self._new_sandbox())
+            self._sessions[session_id] = session
+        if session.seed != body:
+            raise HTTPException(409, "Session is already bound to another request")
+        async with session.lock:
+            if session_id in self._closed:
+                raise HTTPException(409, "Resources session is already closed")
+            if not session.ready:
+                try:
+                    if session.failed:
+                        # Same-session retry: finish the failed attempt's cleanup, then use a fresh handle.
+                        await session.sandbox.stop()
+                        session.sandbox = self._new_sandbox()
+                    await session.sandbox.start(SandboxSpec(image=self.config.image, workdir=WORKDIR))
+                    result = await session.sandbox.exec(f"mkdir -p {INPUT_DIR} {OUTPUT_DIR}", timeout_s=30)
+                    if result.return_code != 0:
+                        raise RuntimeError("Could not prepare GDP sandbox directories")
+                    await self._stage_references(session.sandbox, task)
+                    session.ready = True
+                except BaseException:
+                    session.failed = True
+                    # Leave the handle reachable if stop fails; close_session or a seed retry can stop it.
+                    try:
+                        await session.sandbox.stop()
+                    except BaseException:
+                        LOGGER.exception("GDP seed cleanup failed; retaining session %s", session_id)
+                    raise
+            descriptor = await session.sandbox.serialize()
+            request.session[SESSION_ID_KEY] = session_id
+            return ResourcesSeedSessionResponse(
+                resources_session_id=session_id,
+                sandbox_access=SandboxAccess(
+                    connection=DirectSandboxConnection(
+                        provider_config_ref=self.config.sandbox_provider, descriptor=descriptor
+                    ),
+                    workdir=WORKDIR,
+                ),
+            )
+
+    def _new_sandbox(self) -> AsyncSandbox:
+        return AsyncSandbox(resolve_provider_config(self.config.sandbox_provider, get_global_config_dict()))
+
+    async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
+        with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:
+            local = Path(scratch) / "reference"
+            for name, url in zip(task.reference_files, task.reference_file_urls, strict=True):
+                await self._download_reference(url, local)
+                await sandbox.upload(local, f"{INPUT_DIR}/{name}")
+
+    async def _download_reference(self, url: str, local: Path) -> None:
+        """Download one reference file, retrying throttling and transient failures a few times."""
+        for attempt in range(1, _REFERENCE_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                # Idle reads are bounded separately from the whole attempt: large files take minutes on a slow link.
+                # This loop owns the retries, so request() makes a single try per attempt.
+                response = await http_request(
+                    "GET",
+                    url,
+                    timeout=ClientTimeout(total=1800, sock_connect=60, sock_read=300),
+                    _max_connection_retries=1,
+                )
+                try:
+                    response.raise_for_status()
+                    size = 0
+                    with local.open("wb") as stream:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            size += len(chunk)
+                            if size > _MAX_REFERENCE_BYTES:
+                                # A terminal status: retrying the episode cannot make the file smaller.
+                                raise HTTPException(413, f"Reference file exceeds {_MAX_REFERENCE_BYTES} bytes: {url}")
+                            stream.write(chunk)
+                    return
+                finally:
+                    response.release()
+            except (ClientResponseError, ClientConnectionError, ClientPayloadError, TimeoutError) as error:
+                # Report failures as HTTP errors: a bare aiohttp error would reach the caller as a generic 500.
+                status = getattr(error, "status", None)
+                if status is not None and status not in (408, 429) and status < 500:
+                    # A missing or forbidden file fails the same way on every retry, so the status is terminal.
+                    raise HTTPException(424, f"Reference download failed with HTTP {status}: {url}") from error
+                if attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
+                    raise HTTPException(
+                        503, f"Reference download failed after {attempt} attempts: {error!r}"
+                    ) from error
+                LOGGER.warning("Reference download attempt %d failed for %s: %r", attempt, url, error)
+                await asyncio.sleep(_REFERENCE_RETRY_BASE_DELAY_S * 2 ** (attempt - 1))
+
+    async def export_deliverables(self, session_id: str) -> Path:
+        """Export completed files; caller must have confirmed agent close first."""
+        session = self._sessions.get(session_id)
+        if session is None or not session.ready:
+            raise HTTPException(409, "No ready GDP sandbox for this session")
+        if session.deliverables is not None:
+            return session.deliverables
+        result = await session.sandbox.exec(f"python3 -c {quote(_LIST_OUTPUTS)}", timeout_s=60)
+        if result.return_code != 0:
+            raise HTTPException(503, "GDP artifact export failed: " + (result.stderr or "listing failed")[-1000:])
+        entries = json.loads(result.stdout)
+        if not isinstance(entries, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("size"), int)
+            and item["size"] >= 0
+            and isinstance(item.get("regular"), bool)
+            for item in entries
+        ):
+            raise HTTPException(503, "Invalid GDP artifact listing")
+        self.config.deliverables_root.mkdir(parents=True, exist_ok=True)
+        # An attempt gets a fresh directory. Never delete or overwrite another attempt's files.
+        target = Path(tempfile.mkdtemp(prefix="gdp-", dir=self.config.deliverables_root))
+        total = 0
+        exported = []
+        skipped = []
+        for item in entries:
+            reason = _export_skip_reason(item, len(exported), total)
+            if reason is not None:
+                skipped.append({"name": item["name"], "reason": reason})
+                continue
+            name = item["name"]
+            await session.sandbox.download(f"{OUTPUT_DIR}/{name}", target / name)
+            if (target / name).stat().st_size != item["size"]:
+                raise HTTPException(503, "GDP artifact changed during export")
+            total += item["size"]
+            exported.append(name)
+        if skipped:
+            LOGGER.warning("GDP export for task %s skipped %s", session.seed.task_id.task_id, skipped)
+        # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self.config.deliverables_root, suffix=".tmp", delete=False
+        ) as marker:
+            json.dump({"paths": sorted(exported), "skipped": skipped}, marker)
+        Path(marker.name).replace(target / "finish_params.json")
+        session.deliverables = target
+        return target
+
+    async def _verify_session(self, request: Request, body: GDPValVerifyRequest) -> GDPValVerifyResponse:
+        session_id = request.session.get(SESSION_ID_KEY)
+        session = self._sessions.get(session_id)
+        if session is None or not session.ready or body.task_id != session.seed.task_id.task_id:
+            raise HTTPException(409, "Verification does not match a ready GDP session")
+        async with session.lock:
+            if session.verdict is not None:
+                return session.verdict
+            target = await self.export_deliverables(session_id)
+            # Trust seeded task metadata, never a caller-supplied rubric or host directory.
+            payload = GDPValVerifyRequest.model_validate(
+                session.seed.task_data
+                | {
+                    "responses_create_params": body.responses_create_params,
+                    "response": body.response,
+                    "deliverables_dir": str(target),
+                }
+            )
+            # An invalid verdict is returned, not raised: the rubric mean excludes it, and its export stays
+            # available for judge-only re-scoring instead of re-running the agent with the same seeded judge.
+            session.verdict = await self._grade_deliverables(payload)
+            return session.verdict
+
+    async def close_resources_session(
+        self, request: Request, body: ResourcesCloseSessionRequest
+    ) -> ResourcesCloseSessionResponse:
+        """Release a task sandbox, retaining failed cleanup for a retry."""
+        if self.config.sandbox_provider is None:
+            return await super().close_resources_session(body)
+        session_id = body.resources_session_id
+        closed = self._closed.get(session_id)
+        if closed is not None and closed != body.episode_id:
+            raise HTTPException(409, "Close episode does not match")
+        session = self._sessions.get(session_id)
+        if session is not None:
+            if session.seed.episode_id != body.episode_id:
+                raise HTTPException(409, "Close episode does not match")
+            async with session.lock:
+                async with asyncio.timeout(60):
+                    await session.sandbox.stop()
+                self._sessions.pop(session_id, None)
+        self._closed[session_id] = body.episode_id
+        request.session.pop(SESSION_ID_KEY, None)
+        return ResourcesCloseSessionResponse(resources_session_id=session_id)
 
     def _effective_panel(self) -> List[JudgePanelMember]:
         """The panel to grade with — always a non-empty list of members.
@@ -644,7 +985,18 @@ class GDPValResourcesServer(SimpleResourcesServer):
             )
         return routed, audio_capable, video_capable
 
-    async def verify(self, body: GDPValVerifyRequest) -> GDPValVerifyResponse:
+    async def verify(self, body: GDPValVerifyRequest, *, request: Request = None) -> GDPValVerifyResponse:
+        """Grade existing deliverables or export them from the caller's task sandbox.
+
+        FastAPI supplies request; stateless Python callers may continue to pass only body.
+        """
+        if self.config.sandbox_provider is not None:
+            if request is None:
+                raise HTTPException(409, "GDP sandbox verification requires a session request")
+            return await self._verify_session(request, body)
+        return await self._grade_deliverables(body)
+
+    async def _grade_deliverables(self, body: GDPValVerifyRequest) -> GDPValVerifyResponse:
         if self.config.reward_mode == "comparison":
             return await self._verify_comparison(body)
 
@@ -700,6 +1052,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 include_text=self.config.judge_pdf_include_text,
                 audio_capable=audio_capable,
                 video_capable=video_capable,
+                libreoffice_command=self.config.libreoffice_command,
             )
             if blocks:
                 deliverable_content_blocks = blocks
@@ -765,7 +1118,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
         from resources_servers.gdpval.preconvert import preconvert_dir_async
 
         n_ok, n_fail, errors = await preconvert_dir_async(
-            target_dir, max_concurrent=self.config.preconvert_max_concurrent
+            target_dir,
+            max_concurrent=self.config.preconvert_max_concurrent,
+            libreoffice_command=self.config.libreoffice_command,
         )
         if n_ok or n_fail:
             LOGGER.info("preconvert %s: ok=%d fail=%d", label, n_ok, n_fail)

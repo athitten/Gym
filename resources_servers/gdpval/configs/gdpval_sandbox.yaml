@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Experimental file-task sandbox path, not the AA-v2/Stirrup protocol.
+# Benchmark side only: compose it with a harness config and single_agent_turn_legacy (see the README).
+config_paths:
+- resources_servers/gdpval/configs/gdpval.yaml
+gdpval_resources_server:
+  resources_servers:
+    gdpval:
+      entrypoint: app.py
+      sandbox_provider: sandbox
+      num_workers: 1
+      allowed_agents:
+      - codex_agent
+      image: ???
+      deliverables_root: ???
+      verified: false
+# Requires an existing, audited GDP SIF and Apptainer installation.
+sandbox:
+  apptainer:
+    create:
+      mount_point: /workspace
+      extra_start_args:
+      - --containall
+      - --writable-tmpfs
+    exec:
+      extra_exec_args:
+      - --writable-tmpfs
+gdpval_judge_model:
+  responses_api_models:
+    openai_model:
+      entrypoint: app.py
+      openai_base_url: ???
+      openai_api_key: ???
+      openai_model: ???

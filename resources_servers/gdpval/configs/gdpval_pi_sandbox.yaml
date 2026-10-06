@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Experimental single-task rubric path, not the AA-v2/Stirrup protocol.
+# Pi in per-task GDPVal sandboxes, judged in-session (rubric by default). For multi-stage or judge-only ELO, copy the
+# exports into a cache with resources_servers/gdpval/cache_sandbox_deliverables.py and score that cache judge-only
+# (see "Fresh vs. cached deliverables" in benchmarks/gdpval/README.md).
 config_paths:
 - resources_servers/gdpval/configs/gdpval.yaml
 - responses_api_agents/pi_agent/configs/pi_agent.yaml
@@ -15,6 +17,9 @@ gdpval_resources_server:
       - pi_agent
       image: ???
       deliverables_root: ???
+      # Without LibreOffice on the host, convert Office files with the GDP image instead. The command must see TMPDIR
+      # and the deliverable and reference directories at the same paths.
+      # libreoffice_command: [apptainer, exec, --bind, /lustre, --bind, /tmp, /path/to/gdpval.sif, libreoffice]
       verified: false
 single_agent_turn_legacy:
   environment_servers:

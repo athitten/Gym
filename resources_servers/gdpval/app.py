@@ -47,8 +47,9 @@ from pathlib import Path
 from shlex import quote
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
-from aiohttp import ClientTimeout
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, ClientTimeout
 from fastapi import FastAPI, HTTPException, Request
+from openai import OpenAIError
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from typing_extensions import Self
 
@@ -65,7 +66,9 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef
+from nemo_gym.deliverables import IGNORE_FILES
 from nemo_gym.episode_types import EpisodeId
+from nemo_gym.failure_kinds import JUDGE_FAILED, JUDGE_UNPARSEABLE, VERIFIER_ERROR
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_TERMINAL_KEY
 from nemo_gym.sandbox import AsyncSandbox, SandboxSpec, resolve_provider_config
@@ -78,27 +81,61 @@ from resources_servers.gdpval.judge_panel import (
     make_rng,
     panel_summary,
 )
-from resources_servers.gdpval.scoring import SCORING_ERROR_KEY
-from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, relative_file
+from resources_servers.gdpval.scoring import SCORING_ERROR_KEY, is_permanent_judge_error
+from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, GDPFileTask, json_list, relative_file
 
 
 LOGGER = logging.getLogger(__name__)
-_MAX_BYTES = 128 * 1024 * 1024
+# Per attempt. Two GDPVal gold deliverables exceed 128 MiB (a 171 MiB zip and a 278 MiB video).
+_MAX_EXPORT_BYTES = 1024 * 1024 * 1024
+_MAX_EXPORT_FILES = 100
+# The model controls how many entries are skipped; finish_params.json and the warning keep this many.
+_MAX_SKIPPED_RECORDS = 100
+# Per reference file. The largest GDPVal reference is about 660 MiB (task a941b6d8).
+_MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
+_REFERENCE_DOWNLOAD_ATTEMPTS = 4
+_REFERENCE_RETRY_BASE_DELAY_S = 2.0
+# The model controls how many entries its output directory holds; the listing prints at most this many and counts
+# the rest as unlisted, so a huge directory cannot flood the export.
+_MAX_LISTED_ENTRIES = 10_000
+# Lists the top-level entries the export may copy. It reports a missing or symlinked output directory instead of
+# listing it, so that case is not mistaken for a model that saved nothing.
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
-if root.is_symlink() or not root.is_dir():
-    raise RuntimeError('Output directory is missing or a symlink')
-files = []
-for path in sorted(root.iterdir()):
+usable = root.is_dir() and not root.is_symlink()
+paths = sorted(root.iterdir()) if usable else []
+limit = {_MAX_LISTED_ENTRIES}
+entries = []
+for path in paths[:limit]:
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise RuntimeError('Only regular, non-linked files directly in output are supported')
-    files.append({{'name': path.name, 'size': info.st_size}})
-if len(files) > 100 or sum(item['size'] for item in files) > {_MAX_BYTES}:
-    raise RuntimeError('Deliverable limit exceeded')
-print(json.dumps(files))
+    regular = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    entries.append({{'name': path.name, 'size': info.st_size, 'regular': regular}})
+print(json.dumps({{'output_dir': usable, 'entries': entries, 'unlisted': len(paths) - len(entries)}}))
 """
+
+
+def _export_skip_reason(item: Dict[str, Any], exported: int, total: int) -> Optional[str]:
+    """Why a listed output entry is not exported, or None when it is.
+
+    The model owns the output layout, so an entry the judge cannot read is skipped and recorded rather than
+    failed as an infrastructure error. Judges read only top-level regular files.
+    """
+    if item["name"] in IGNORE_FILES:
+        return "reserved run-state name"
+    if item["regular"] is not True:
+        return "not a regular file"
+    try:
+        plain = "/" not in relative_file(item["name"])
+    except ValueError:
+        plain = False
+    if not plain:
+        return "unsupported file name"
+    if exported >= _MAX_EXPORT_FILES:
+        return "file count limit"
+    if total + item["size"] > _MAX_EXPORT_BYTES:
+        return "size limit"
+    return None
 
 
 def _is_invalid_judge_result(judge_result: Any) -> bool:
@@ -114,6 +151,17 @@ def _is_invalid_judge_result(judge_result: Any) -> bool:
     if judge_result is None:
         return True
     return isinstance(judge_result, dict) and bool(judge_result.get(SCORING_ERROR_KEY))
+
+
+def _invalid_verdict_failure_kind(scoring_error: Optional[str]) -> str:
+    """Shared failure kind (``nemo_gym.failure_kinds``) for a verdict flagged ``invalid_judge_response``.
+
+    Without a scoring error the judge call failed or returned no text. A scoring error means the judge answered
+    but its reply could not be scored, except a missing rubric, which is a task-data fault.
+    """
+    if scoring_error == "missing_rubric":
+        return VERIFIER_ERROR
+    return JUDGE_UNPARSEABLE if scoring_error else JUDGE_FAILED
 
 
 _DEFAULT_JUDGE_PROMPT_FPATH = str(Path(__file__).parent / "prompts" / "judge_prompt.j2")
@@ -348,6 +396,14 @@ class GDPValResourcesServerConfig(BaseResourcesServerConfig):
     # read tables/charts. Costs ~5-30s per Office file.
     preconvert_office_to_pdf: bool = True
     preconvert_max_concurrent: int = 4
+    # Command that runs LibreOffice for every Office->PDF conversion (comparison
+    # preconvert and rubric rendering), e.g. a container prefix
+    # [apptainer, exec, --bind, /lustre, --bind, /tmp, /path/gdpval.sif, libreoffice]
+    # or a wrapper script. It must see the deliverable, reference and temp
+    # directories at the same absolute paths. When set, startup checks it with
+    # --version and a probe conversion and fails if the check fails; the host
+    # javaldx check and apt install are skipped. None uses `libreoffice` on PATH.
+    libreoffice_command: Optional[List[str]] = Field(default=None, min_length=1)
 
     # How deliverable/reference files are presented to the judge:
     # - ``"native_pdf"`` (default): PDFs and (preconverted) Office docs are sent
@@ -466,6 +522,12 @@ class GDPValVerifyRequest(BaseVerifyRequest):
     ng_rollout_index: Optional[int] = Field(default=None, alias="_ng_rollout_index")
     ng_attempt_index: Optional[int] = Field(default=None, alias="_ng_attempt_index")
 
+    @field_validator("reference_file_urls", mode="before")
+    @classmethod
+    def parse_reference_file_urls(cls, value: object) -> object:
+        # Accept the JSON-encoded list that GDPFileTask accepts at seed time.
+        return json_list(value)
+
 
 # The reference model has no deliverable for this task, so no battle can be
 # scored. An infrastructure gap, not a model outcome. Kept here rather than in
@@ -514,6 +576,8 @@ class _Session:
     seed: ResourcesSeedSessionRequest
     sandbox: AsyncSandbox
     ready: bool = False
+    # A failed seed stopped (or failed to stop) this sandbox; AsyncSandbox cannot start again after stop().
+    failed: bool = False
     deliverables: Path | None = None
     verdict: GDPValVerifyResponse | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -545,7 +609,18 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise ValueError(
                     "reward_mode=comparison requires reference_deliverables_dir or reference_models to be set"
                 )
-        if self.config.preconvert_office_to_pdf:
+        if self.config.libreoffice_command is not None:
+            from resources_servers.gdpval.setup_libreoffice import ensure_libreoffice
+
+            # Also probe where sandbox exports land: a command that cannot see them falls back to text on every task.
+            probe_dirs = [self.config.deliverables_root] if self.config.deliverables_root is not None else []
+            if not ensure_libreoffice(self.config.libreoffice_command, probe_dirs=probe_dirs):
+                raise RuntimeError(
+                    f"libreoffice_command {self.config.libreoffice_command} failed its startup check "
+                    "(--version and a probe conversion; see the warning above). The command must see "
+                    "the deliverables, reference and temp directories at the same paths."
+                )
+        elif self.config.preconvert_office_to_pdf:
             from resources_servers.gdpval.setup_libreoffice import ensure_libreoffice
 
             if not ensure_libreoffice() and self.config.reward_mode == "comparison":
@@ -595,8 +670,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
             raise HTTPException(409, "Resources session is already closed")
         session = self._sessions.get(session_id)
         if session is None:
-            provider = resolve_provider_config(self.config.sandbox_provider, get_global_config_dict())
-            session = _Session(body.model_copy(deep=True), AsyncSandbox(provider))
+            session = _Session(body.model_copy(deep=True), self._new_sandbox())
             self._sessions[session_id] = session
         if session.seed != body:
             raise HTTPException(409, "Session is already bound to another request")
@@ -605,6 +679,10 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise HTTPException(409, "Resources session is already closed")
             if not session.ready:
                 try:
+                    if session.failed:
+                        # Same-session retry: finish the failed attempt's cleanup, then use a fresh handle.
+                        await session.sandbox.stop()
+                        session.sandbox = self._new_sandbox()
                     await session.sandbox.start(SandboxSpec(image=self.config.image, workdir=WORKDIR))
                     result = await session.sandbox.exec(f"mkdir -p {INPUT_DIR} {OUTPUT_DIR}", timeout_s=30)
                     if result.return_code != 0:
@@ -612,7 +690,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     await self._stage_references(session.sandbox, task)
                     session.ready = True
                 except BaseException:
-                    # Leave the handle reachable if stop fails; close_session can retry.
+                    session.failed = True
+                    # Leave the handle reachable if stop fails; close_session or a seed retry can stop it.
                     try:
                         await session.sandbox.stop()
                     except BaseException:
@@ -630,23 +709,56 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 ),
             )
 
+    def _new_sandbox(self) -> AsyncSandbox:
+        return AsyncSandbox(resolve_provider_config(self.config.sandbox_provider, get_global_config_dict()))
+
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
         with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:
+            local = Path(scratch) / "reference"
             for name, url in zip(task.reference_files, task.reference_file_urls, strict=True):
-                response = await http_request("GET", url, timeout=ClientTimeout(total=180))
+                await self._download_reference(url, local)
+                await sandbox.upload(local, f"{INPUT_DIR}/{name}")
+
+    async def _download_reference(self, url: str, local: Path) -> None:
+        """Download one reference file, retrying throttling and transient failures a few times."""
+        for attempt in range(1, _REFERENCE_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                # Idle reads are bounded separately from the whole attempt: large files take minutes on a slow link.
+                # This loop owns the retries, so request() makes a single try per attempt.
+                response = await http_request(
+                    "GET",
+                    url,
+                    timeout=ClientTimeout(total=1800, sock_connect=60, sock_read=300),
+                    _max_connection_retries=1,
+                )
                 try:
                     response.raise_for_status()
-                    local = Path(scratch) / "reference"
                     size = 0
                     with local.open("wb") as stream:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
                             size += len(chunk)
-                            if size > _MAX_BYTES:
-                                raise RuntimeError("Reference file exceeds prototype download limit")
+                            if size > _MAX_REFERENCE_BYTES:
+                                # A terminal status: retrying the episode cannot make the file smaller.
+                                raise HTTPException(413, f"Reference file exceeds {_MAX_REFERENCE_BYTES} bytes: {url}")
                             stream.write(chunk)
-                    await sandbox.upload(local, f"{INPUT_DIR}/{name}")
+                    return
                 finally:
                     response.release()
+            except (ClientResponseError, ClientConnectionError, ClientPayloadError, TimeoutError) as error:
+                # Report failures as HTTP errors: a bare aiohttp error would reach the caller as a generic 500.
+                status = getattr(error, "status", None)
+                # A missing or forbidden file fails the same way on every retry, so a 4xx is terminal, except timeout
+                # and throttling statuses. aiohttp reports some malformed responses as status 0, which is retried.
+                if status is not None and 400 <= status < 500 and status not in (408, 425, 429):
+                    raise HTTPException(424, f"Reference download failed with HTTP {status}: {url}") from error
+                if attempt == _REFERENCE_DOWNLOAD_ATTEMPTS:
+                    raise HTTPException(
+                        503, f"Reference download failed after {attempt} attempts: {error!r}"
+                    ) from error
+                LOGGER.warning("Reference download attempt %d failed for %s: %r", attempt, url, error)
+                await asyncio.sleep(_REFERENCE_RETRY_BASE_DELAY_S * 2 ** (attempt - 1))
+        # Fail closed: the caller stages whatever bytes are at local, which could be partial or an earlier file.
+        raise HTTPException(503, f"Reference download did not complete: {url}")
 
     async def export_deliverables(self, session_id: str) -> Path:
         """Export completed files; caller must have confirmed agent close first."""
@@ -658,23 +770,60 @@ class GDPValResourcesServer(SimpleResourcesServer):
         result = await session.sandbox.exec(f"python3 -c {quote(_LIST_OUTPUTS)}", timeout_s=60)
         if result.return_code != 0:
             raise HTTPException(503, "GDP artifact export failed: " + (result.stderr or "listing failed")[-1000:])
-        files = json.loads(result.stdout)
-        if not isinstance(files, list) or len(files) > 100:
+        listing = json.loads(result.stdout)
+        output_dir = listing.get("output_dir") if isinstance(listing, dict) else None
+        entries = listing.get("entries") if isinstance(listing, dict) else None
+        unlisted = listing.get("unlisted") if isinstance(listing, dict) else None
+        # Nothing may be exported from a directory the listing itself reports as unusable.
+        if (
+            not isinstance(output_dir, bool)
+            or not isinstance(entries, list)
+            or not isinstance(unlisted, int)
+            or unlisted < 0
+            or (entries and not output_dir)
+            or not all(
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("size"), int)
+                and item["size"] >= 0
+                and isinstance(item.get("regular"), bool)
+                for item in entries
+            )
+        ):
             raise HTTPException(503, "Invalid GDP artifact listing")
         self.config.deliverables_root.mkdir(parents=True, exist_ok=True)
         # An attempt gets a fresh directory. Never delete or overwrite another attempt's files.
         target = Path(tempfile.mkdtemp(prefix="gdp-", dir=self.config.deliverables_root))
         total = 0
-        for item in files:
-            name = relative_file(item["name"])
-            if "/" in name or not isinstance(item["size"], int) or item["size"] < 0:
-                raise HTTPException(503, "Invalid GDP artifact entry")
-            total += item["size"]
-            if total > _MAX_BYTES:
-                raise HTTPException(503, "GDP artifact size limit exceeded")
+        exported = []
+        skipped = [] if output_dir else [{"name": OUTPUT_DIR, "reason": "output directory missing or a symlink"}]
+        for item in entries:
+            reason = _export_skip_reason(item, len(exported), total)
+            if reason is not None:
+                skipped.append({"name": item["name"], "reason": reason})
+                continue
+            name = item["name"]
             await session.sandbox.download(f"{OUTPUT_DIR}/{name}", target / name)
             if (target / name).stat().st_size != item["size"]:
                 raise HTTPException(503, "GDP artifact changed during export")
+            total += item["size"]
+            exported.append(name)
+        # Entries past the listing limit are never exported, so they count as skipped too.
+        skipped_count = len(skipped) + unlisted
+        record = {"paths": sorted(exported), "skipped": skipped[:_MAX_SKIPPED_RECORDS], "skipped_count": skipped_count}
+        if skipped_count:
+            LOGGER.warning(
+                "GDP export for task %s skipped %d entries: %s",
+                session.seed.task_id.task_id,
+                skipped_count,
+                record["skipped"],
+            )
+        # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self.config.deliverables_root, suffix=".tmp", delete=False
+        ) as marker:
+            json.dump(record, marker)
+        Path(marker.name).replace(target / "finish_params.json")
         session.deliverables = target
         return target
 
@@ -696,11 +845,42 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     "deliverables_dir": str(target),
                 }
             )
-            verdict = await self._grade_deliverables(payload)
-            if verdict.invalid_judge_response:
-                raise HTTPException(503, "GDP judge did not return a valid verdict")
-            session.verdict = verdict
+            session.verdict = await self._grade_session(payload)
             return session.verdict
+
+    async def _grade_session(self, payload: GDPValVerifyRequest) -> GDPValVerifyResponse:
+        """Grade a session export, returning a masked placeholder verdict when judging fails.
+
+        A failed /verify would send the row to the failures sidecar without its export, so judge-only scoring could
+        not re-judge it and a resume would re-run the agent with the same seeded judge. The placeholder keeps
+        ``deliverables_dir``; its 0.0 is masked so reward profiling and trainers skip it, as the rubric mean does.
+        """
+        try:
+            verdict = await self._grade_deliverables(payload)
+        except Exception as error:  # Cancellation is not an Exception, so it still propagates.
+            LOGGER.exception("GDP judging failed for task %s; returning a masked verdict", payload.task_id)
+            # A 413 or context-window judge error fails the same way again; anything else may pass on a retry.
+            permanent = is_permanent_judge_error(error)
+            return GDPValVerifyResponse(
+                **payload.model_dump(),
+                reward=0.0,
+                verify_mode=self.config.reward_mode,
+                invalid_judge_response=True,
+                invalid_judge_retryable=not permanent,
+                mask_sample=True,
+                failure_kind=JUDGE_FAILED if permanent or isinstance(error, OpenAIError) else VERIFIER_ERROR,
+                failure_reason=f"judging raised {type(error).__name__}: {error}"[:2000],
+            )
+        if not verdict.invalid_judge_response:
+            return verdict
+        error = (verdict.judge_response or {}).get(SCORING_ERROR_KEY)
+        return verdict.model_copy(
+            update={
+                "mask_sample": True,
+                "failure_kind": _invalid_verdict_failure_kind(error),
+                "failure_reason": f"judge returned an invalid response: {error or 'no result'}",
+            }
+        )
 
     async def close_resources_session(
         self, request: Request, body: ResourcesCloseSessionRequest
@@ -949,6 +1129,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 include_text=self.config.judge_pdf_include_text,
                 audio_capable=audio_capable,
                 video_capable=video_capable,
+                libreoffice_command=self.config.libreoffice_command,
             )
             if blocks:
                 deliverable_content_blocks = blocks
@@ -1014,7 +1195,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
         from resources_servers.gdpval.preconvert import preconvert_dir_async
 
         n_ok, n_fail, errors = await preconvert_dir_async(
-            target_dir, max_concurrent=self.config.preconvert_max_concurrent
+            target_dir,
+            max_concurrent=self.config.preconvert_max_concurrent,
+            libreoffice_command=self.config.libreoffice_command,
         )
         if n_ok or n_fail:
             LOGGER.info("preconvert %s: ok=%d fail=%d", label, n_ok, n_fail)
@@ -1629,9 +1812,11 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 base = await super().aggregate_metrics(AggregateMetricsRequest(verify_responses=valid_responses))
             else:
                 base = AggregateMetrics()
-            # These describe only the rows supplied to aggregation. Runtime
-            # judge failures live in the collection sidecar and are intentionally
-            # not presented as run-level coverage here.
+            # These describe only the rows supplied to aggregation. Sandbox
+            # sessions return invalid verdicts as masked rows, so those are
+            # counted here, while Stirrup sends its invalid verdicts to the
+            # failures sidecar. The "legacy" key name predates sandbox sessions
+            # and is kept for compatibility.
             coverage: Dict[str, Any] = {
                 "rubric/aggregate_rows_total": total_count,
                 "rubric/aggregate_rows_included": valid_count,

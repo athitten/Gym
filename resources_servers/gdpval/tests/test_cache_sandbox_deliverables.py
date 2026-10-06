@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import json
+import shutil
 
 import pytest
 
@@ -41,7 +42,31 @@ def test_cache_matches_judge_only_layout(tmp_path):
     # An attempt that exported nothing is still finished, so it is judged rather than reported missing.
     assert task_attempted(str(tmp_path / "cache" / "task_t2" / "repeat_1"))
     assert [p.name for p in _iter_ref_repeat_dirs(tmp_path / "cache" / "task_t1")] == ["repeat_0"]
-    assert not list((tmp_path / "cache").rglob("*.partial"))
+    # The staging area is removed once the cache is built.
+    assert sorted(p.name for p in (tmp_path / "cache").iterdir()) == ["task_t1", "task_t2"]
+
+
+def test_failed_copy_never_looks_like_an_attempt(tmp_path, monkeypatch):
+    export = _export(tmp_path / "exports", "gdp-a", {"a.xlsx": "a", "b.xlsx": "b"})
+    rollouts = _rollouts(tmp_path / "rollouts.jsonl", [{"task_id": "t1", "deliverables_dir": str(export)}])
+    copytree = shutil.copytree
+    copied = []
+
+    def copy_one_then_fail(source, destination):
+        if copied:
+            raise OSError("disk full")
+        copied.append(destination)
+        return shutil.copy2(source, destination)
+
+    monkeypatch.setattr(
+        shutil, "copytree", lambda source, target: copytree(source, target, copy_function=copy_one_then_fail)
+    )
+    with pytest.raises(OSError):
+        build_cache(rollouts, tmp_path / "cache")
+    assert copied
+    # Judge-only scoring would treat a leftover repeat_* directory under task_t1 as an attempt.
+    assert _iter_ref_repeat_dirs(tmp_path / "cache" / "task_t1") == []
+    assert list((tmp_path / "cache").iterdir()) == []
 
 
 def test_rows_without_completed_export_are_skipped(tmp_path):

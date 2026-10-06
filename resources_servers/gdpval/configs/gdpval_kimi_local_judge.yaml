@@ -4,10 +4,13 @@
 # GDPVal judge overlay: swap the default remote frontier-judge panel for a
 # gym-spawned, LOCAL, MULTIMODAL Kimi-K2.6 judge served in vLLM.
 #
-# Chain this AFTER the benchmark config, e.g.:
+# Chain this AFTER the benchmark config, loaded with --config rather than
+# --benchmark gdpval: the CLI appends --benchmark after every --config, so the
+# benchmark's judge panel would silently override this overlay. E.g.:
 #
-#   gym eval run --benchmark gdpval --model-type vllm_model \
+#   gym eval run --config benchmarks/gdpval/config.yaml \
 #     --config resources_servers/gdpval/configs/gdpval_kimi_local_judge.yaml \
+#     --model-type vllm_model \
 #     --split benchmark --output results/gdpval_kimi_judge.jsonl \
 #     ++gdpval_resources_server.resources_servers.gdpval.reward_mode=comparison \
 #     ++gdpval_resources_server.resources_servers.gdpval.reference_models...=...

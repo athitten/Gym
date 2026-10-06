@@ -14,15 +14,19 @@
 #   export MINIMAX_MODEL=minimax-m3                   # match --served-model-name
 #   curl -s "$MINIMAX_BASE_URL/models"                # confirm it's up
 #
-# ── STEP 2: run multi-stage ELO through the benchmark's driver. `--benchmark
-#            gdpval` loads the multistage orchestrator + policy model + dataset;
+# ── STEP 2: run multi-stage ELO through the benchmark's driver. The benchmark
+#            config loads the multistage orchestrator + policy model + dataset;
 #            this overlay swaps in comparison mode + the MiniMax judge; the
-#            ++multistage.* flags opt into staged ELO:
+#            ++multistage.* flags opt into staged ELO. Load the benchmark with
+#            --config before this overlay, not with --benchmark gdpval: the CLI
+#            appends --benchmark after every --config, so the benchmark would
+#            silently override this overlay (rubric mode, frontier panel):
 #
 #   export PERSIST_DELIVERABLES_DIR=/abs/path/to/eval_deliverables_cache
 #   gym eval run \
-#     --model-type vllm_model --benchmark gdpval --split benchmark \
+#     --config benchmarks/gdpval/config.yaml \
 #     --config resources_servers/gdpval/configs/gdpval_minimax_multistage_judge.yaml \
+#     --model-type vllm_model --split benchmark \
 #     --output results/gdpval_minimax_multistage.jsonl \
 #     ++multistage.enabled=true \
 #     ++multistage.stages='[{num_tasks: 5}, {num_tasks: 15, num_models: 4}]' \

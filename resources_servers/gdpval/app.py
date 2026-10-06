@@ -745,6 +745,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     ) from error
                 LOGGER.warning("Reference download attempt %d failed for %s: %r", attempt, url, error)
                 await asyncio.sleep(_REFERENCE_RETRY_BASE_DELAY_S * 2 ** (attempt - 1))
+        # Fail closed: the caller stages whatever bytes are at local, which could be partial or an earlier file.
+        raise HTTPException(503, f"Reference download did not complete: {url}")
 
     async def export_deliverables(self, session_id: str) -> Path:
         """Export completed files; caller must have confirmed agent close first."""

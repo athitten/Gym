@@ -2511,6 +2511,33 @@ async def test_interrupted_reference_download_is_rewritten(sandbox_server, monke
     assert box.files["/workspace/input/b.xlsx"] == b"second"
 
 
+async def test_reference_interrupted_on_every_attempt_is_never_staged(sandbox_server, monkeypatch):
+    instance, box, request = sandbox_server
+    attempts = gdp_app._REFERENCE_DOWNLOAD_ATTEMPTS
+    download = _reference_download(*[(b"partial", ClientPayloadError("connection lost")) for _ in range(attempts)])
+    monkeypatch.setattr(gdp_app, "http_request", download)
+    monkeypatch.setattr(gdp_app, "_REFERENCE_RETRY_BASE_DELAY_S", 0)
+    with pytest.raises(HTTPException) as raised:
+        await instance.seed_session(request, _seed_with_reference())
+    assert raised.value.status_code == 503
+    assert download.await_count == attempts
+    assert "/workspace/input/a.xlsx" not in box.files
+    box.stop.assert_awaited_once()
+    box.serialize.assert_not_awaited()
+
+
+async def test_reference_download_without_a_finished_attempt_fails_closed(sandbox_server, monkeypatch, tmp_path):
+    instance, _, _ = sandbox_server
+    # Seeding reuses one scratch path for every reference, so an early return would stage the previous file.
+    local = tmp_path / "reference"
+    local.write_bytes(b"previous reference")
+    monkeypatch.setattr(gdp_app, "_REFERENCE_DOWNLOAD_ATTEMPTS", 0)
+    monkeypatch.setattr(gdp_app, "http_request", AsyncMock(side_effect=AssertionError("no attempt expected")))
+    with pytest.raises(HTTPException) as raised:
+        await instance._download_reference("https://example.com/a.xlsx", local)
+    assert raised.value.status_code == 503
+
+
 async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server, monkeypatch):
     instance, box, request = sandbox_server
     await instance.seed_session(request, seed())

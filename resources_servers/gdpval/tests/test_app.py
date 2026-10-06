@@ -2914,6 +2914,7 @@ async def test_export_writes_completion_marker_and_skips_run_state_files(sandbox
             {"name": "finish_params.json", "reason": "reserved run-state name"},
             {"name": "history.json", "reason": "reserved run-state name"},
         ],
+        "skipped_count": 2,
     }
     assert task_attempted(str(target))
     assert not list(instance.config.deliverables_root.glob("*.tmp"))
@@ -2928,6 +2929,7 @@ async def test_unusable_output_directory_is_recorded_not_read_as_empty(sandbox_s
     assert json.loads((target / "finish_params.json").read_text()) == {
         "paths": [],
         "skipped": [{"name": "/workspace/output", "reason": "output directory missing or a symlink"}],
+        "skipped_count": 1,
     }
     # Still a finished attempt, so the judge scores the empty submission instead of reporting it missing.
     assert task_attempted(str(target))
@@ -2965,6 +2967,7 @@ async def test_model_output_layout_is_skipped_and_still_graded(sandbox_server, m
             {"name": "charts", "reason": "not a regular file"},
             {"name": "link.csv", "reason": "not a regular file"},
         ],
+        "skipped_count": 3,
     }
 
 
@@ -2986,8 +2989,27 @@ async def test_export_limits_skip_files_beyond_count_and_size(sandbox_server, mo
     assert json.loads((target / "finish_params.json").read_text()) == {
         "paths": ["a.txt", "c.txt"],
         "skipped": [{"name": "b.txt", "reason": "size limit"}, {"name": "d.txt", "reason": "file count limit"}],
+        "skipped_count": 2,
     }
     assert sorted(p.name for p in target.iterdir()) == ["a.txt", "c.txt", "finish_params.json"]
+
+
+async def test_skipped_record_keeps_the_first_entries_and_counts_all(sandbox_server, caplog):
+    instance, box, request = sandbox_server
+    await instance.seed_session(request, seed())
+    names = [f"dir{index:03d}" for index in range(gdp_app._MAX_SKIPPED_RECORDS + 50)]
+    box.exec.side_effect = None
+    box.exec.return_value = _listing(*[(name, 4096, False) for name in names], ("report.csv", 15, True))
+    with caplog.at_level("WARNING", logger=gdp_app.LOGGER.name):
+        target = await instance.export_deliverables("resources-1")
+    kept = [{"name": name, "reason": "not a regular file"} for name in names[: gdp_app._MAX_SKIPPED_RECORDS]]
+    assert json.loads((target / "finish_params.json").read_text()) == {
+        "paths": ["report.csv"],
+        "skipped": kept,
+        "skipped_count": len(names),
+    }
+    [warning] = [record.getMessage() for record in caplog.records if "skipped" in record.getMessage()]
+    assert f"skipped {len(names)} entries: {kept}" in warning
 
 
 @pytest.mark.parametrize(

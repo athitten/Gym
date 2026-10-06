@@ -88,6 +88,8 @@ LOGGER = logging.getLogger(__name__)
 # Per attempt. Two GDPVal gold deliverables exceed 128 MiB (a 171 MiB zip and a 278 MiB video).
 _MAX_EXPORT_BYTES = 1024 * 1024 * 1024
 _MAX_EXPORT_FILES = 100
+# The model controls how many entries are skipped; finish_params.json and the warning keep this many.
+_MAX_SKIPPED_RECORDS = 100
 # Per reference file. The largest GDPVal reference is about 660 MiB (task a941b6d8).
 _MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
 _REFERENCE_DOWNLOAD_ATTEMPTS = 4
@@ -795,13 +797,19 @@ class GDPValResourcesServer(SimpleResourcesServer):
                 raise HTTPException(503, "GDP artifact changed during export")
             total += item["size"]
             exported.append(name)
+        record = {"paths": sorted(exported), "skipped": skipped[:_MAX_SKIPPED_RECORDS], "skipped_count": len(skipped)}
         if skipped:
-            LOGGER.warning("GDP export for task %s skipped %s", session.seed.task_id.task_id, skipped)
+            LOGGER.warning(
+                "GDP export for task %s skipped %d entries: %s",
+                session.seed.task_id.task_id,
+                len(skipped),
+                record["skipped"],
+            )
         # Comparison scoring treats a deliverables directory without this marker as an unfinished attempt.
         with tempfile.NamedTemporaryFile(
             "w", dir=self.config.deliverables_root, suffix=".tmp", delete=False
         ) as marker:
-            json.dump({"paths": sorted(exported), "skipped": skipped}, marker)
+            json.dump(record, marker)
         Path(marker.name).replace(target / "finish_params.json")
         session.deliverables = target
         return target

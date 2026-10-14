@@ -32,7 +32,10 @@ def run(params: dict) -> int:
         process = subprocess.Popen(
             params["command"],
             cwd=params["cwd"],
-            env={**{key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}, **params["env"]},
+            env={
+                **{key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "HOME") if key in os.environ},
+                **params["env"],
+            },
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=stderr,

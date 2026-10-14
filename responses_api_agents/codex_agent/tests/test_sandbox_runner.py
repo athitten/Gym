@@ -77,6 +77,28 @@ def test_capture_and_stdin(tmp_path):
     assert event["prompt"] == "task input"
 
 
+@pytest.mark.parametrize("payload_env", [{}, {"HOME": "/session-home"}])
+def test_codex_keeps_the_task_home_unless_the_payload_sets_one(tmp_path, monkeypatch, payload_env):
+    task_home = tmp_path / "task-home"
+    monkeypatch.setenv("HOME", str(task_home))
+    request = {
+        "directory": str(tmp_path),
+        "command": [
+            sys.executable,
+            "-c",
+            "import json,os; print(json.dumps({'type':'env','home':os.environ.get('HOME')}))",
+        ],
+        "cwd": str(tmp_path),
+        "env": payload_env,
+        "prompt": "task input",
+    }
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(request))
+    assert sandbox_runner.run(json.loads(path.read_text())) == 0
+    _, event = json.loads((tmp_path / "events.jsonl").read_text())
+    assert event["home"] == payload_env.get("HOME", str(task_home))
+
+
 @pytest.mark.parametrize("ending", ["natural", "timeout", "cancel"])
 def test_detached_descendants_are_gone_before_receipt(tmp_path, ending):
     # The grandchild starts a new session, escaping process-group-only cleanup.

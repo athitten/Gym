@@ -80,8 +80,9 @@ POSIX sh installs missing Python and Bash using apt-get or apk when running as r
 before invoking the Bash runtime installer; otherwise the image must provide them.
 The pinned Node 22.19.0 build has no arm64 musl binary.
 Older Alpine images use a checksum-verified private C++ library for Node. Runtime files live
-under `/tmp/nemo-gym-codex-node-*`, and session HOME/cache/config live under
-`/tmp/nemo-gym-codex-sessions/*`. Task Python, Node, libraries, and PATH are preserved.
+under `/tmp/nemo-gym-codex-node-*`, and Codex's config, state and cache (`CODEX_HOME`, `XDG_CACHE_HOME`) live
+under `/tmp/nemo-gym-codex-sessions/*`. Task Python, Node, libraries, PATH and HOME are preserved, so a file
+the model writes under `~` stays in the task sandbox after the session directory is removed at close.
 Installation errors retain the command, exit status, stdout, and stderr. Runtime compatibility
 must still be checked on actual task images; a mocked installer test is not image validation.
 

@@ -205,6 +205,9 @@ def test_http_native_flow_runs_codex_in_borrowed_sandbox(setup):
             assert payload["prompt"] == "Fix the code"
             assert payload["command"][0].endswith("/node/bin/node")
             assert "PATH" not in payload["env"]
+            # Codex keeps the task's HOME; only its own config and cache move into the session directory.
+            assert "HOME" not in payload["env"]
+            assert payload["env"]["CODEX_HOME"] == f"{sandbox.directory}/home/.codex"
             config = tomllib.loads(sandbox.files[f"{sandbox.directory}/home/.codex/config.toml"])
             assert (
                 config["model_providers"]["gym"]["base_url"]

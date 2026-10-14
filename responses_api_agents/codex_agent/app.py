@@ -723,8 +723,9 @@ class CodexAgent(SimpleResponsesAPIAgent):
             "command": command,
             "prompt": prompt,
             "cwd": state.session.workdir,
+            # Codex and its commands keep the task's HOME, so a file the model writes under ~ is still in the
+            # task sandbox when the session directory is removed at close; only Codex's own state moves here.
             "env": {
-                "HOME": f"{state.session.session_dir}/home",
                 "CODEX_HOME": f"{state.session.session_dir}/home/.codex",
                 "XDG_CACHE_HOME": f"{state.session.session_dir}/home/.cache",
                 # Gym receives the calls; never copy the direct OpenAI credential into this path.

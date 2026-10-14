@@ -235,6 +235,9 @@ def test_http_session_flow_runs_pi_in_borrowed_sandbox(setup):
             assert payload["prompt"] == "Fix the code"
             assert payload["command"][0].endswith("/node/bin/node")
             assert "PATH" not in payload["env"]
+            # Pi's tools keep the task's HOME; only Pi's own files live in the session directory, which close removes.
+            assert "HOME" not in payload["env"]
+            assert payload["env"]["PI_CODING_AGENT_DIR"] == f"{sandbox.directory}/home/.pi/agent"
             extension = f"{sandbox.directory}/output-limit.mjs"
             assert sandbox.files[extension] == Path(__file__).parents[1].joinpath("output-limit.mjs").read_text()
             assert payload["command"][payload["command"].index("--extension") + 1] == extension

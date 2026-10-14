@@ -89,8 +89,10 @@ The provider must support sandbox exec and file upload/download.
 Installation needs network access to nodejs.org and npm; musl also uses unofficial-builds.nodejs.org
 and, for the older C++ runtime fallback, dl-cdn.alpinelinux.org.
 
-The Node runtime, Pi package, and isolated HOME are outside the task repository. Pi's
-Node is addressed by absolute path; it does not replace the task's Python or Node on PATH.
+The Node runtime, Pi package, and Pi's own files (`PI_CODING_AGENT_DIR`) are outside the task
+repository. Pi's tools keep the task's HOME, so a file the agent saves under `~` is still there
+after session close removes the session directory. Pi's Node is addressed by absolute path; it does
+not replace the task's Python or Node on PATH.
 Sandbox sessions bound each bash command and advise the agent to search repository/local
 dependency directories rather than shared mounts. This returns control after a stalled tool;
 the separate `timeout` still bounds the whole agent episode. Installer errors include both
